@@ -39,7 +39,8 @@ struct GPU<'a> {
     pad_height: u32,
 
     render_pipeline: wgpu::RenderPipeline,
-    compute_pipeline: wgpu::ComputePipeline,
+    diffusion_pipeline: wgpu::ComputePipeline,
+    movement_pipeline: wgpu::ComputePipeline,
     line_pipeline: wgpu::ComputePipeline,
 
     line_group_layout: wgpu::BindGroupLayout,
@@ -56,7 +57,7 @@ struct GPU<'a> {
 
 impl<'a> GPU<'a> {
     async fn new(window: Arc<Window>,backing_width: u32, backing_height: u32) -> Self {
-        let pad_width = pad(backing_width,64);
+        let pad_width = pad(backing_width,16);
         let pad_height = pad(backing_height,8);
 
         let instance = wgpu::Instance::default();
@@ -120,20 +121,24 @@ impl<'a> GPU<'a> {
                         min_binding_size: None
                     },
                     count: None
-                }
-            ]
-        });
-
-        let secondary_diffuse_storage_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
-            label: Some("Compute Group Layout"), 
-            entries: &[
+                },
                 wgpu::BindGroupLayoutEntry{
-                    binding: 10,
+                    binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer{ 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: None
+                        min_binding_size: None 
+                    },
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer{ 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: None 
                     },
                     count: None
                 }
@@ -147,7 +152,7 @@ impl<'a> GPU<'a> {
                     binding: 10,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture{ 
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true }, 
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false }, 
                         view_dimension: wgpu::TextureViewDimension::D2, 
                         multisampled: false
                     },
@@ -156,7 +161,7 @@ impl<'a> GPU<'a> {
                 wgpu::BindGroupLayoutEntry{
                     binding: 11,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None
                 }
             ]
@@ -166,12 +171,22 @@ impl<'a> GPU<'a> {
             label: Some("Line Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry{
-                    binding: 0,
+                    binding: 10,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer{ 
                         ty: wgpu::BufferBindingType::Storage { read_only: true }, 
                         has_dynamic_offset: false, 
                         min_binding_size: None 
+                    },
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer{ 
+                        ty: wgpu::BufferBindingType::Uniform, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: None,
                     },
                     count: None
                 }
@@ -225,17 +240,32 @@ impl<'a> GPU<'a> {
             cache: None, // 6.
         });
 
-        let compute_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
-            label: Some("Compute Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&secondary_diffuse_storage_group_layout],
+        let diffusion_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
+            label: Some("Diffusion Pipeline Layout"),
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout],
             push_constant_ranges: &[]
         });
 
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
-            label: Some("Compute Pipeline"),
-            layout: Some(&compute_pipeline_layout),
+        let diffusion_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+            label: Some("Diffusion Pipeline"),
+            layout: Some(&diffusion_pipeline_layout),
             module: &shader,
-            entry_point: "cs_main",
+            entry_point: "diffusion_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None
+        });
+
+        let movement_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
+            label: Some("Movement Pipeline Layout"),
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout],
+            push_constant_ranges: &[]
+        });
+
+        let movement_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+            label: Some("Movement Pipeline"),
+            layout: Some(&movement_pipeline_layout),
+            module: &shader,
+            entry_point: "movement_main",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None
         });
@@ -263,15 +293,43 @@ impl<'a> GPU<'a> {
 
         let diffuse_storage = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Diffuse Buffer"),
-            size: pad_width  as u64 * backing_height as u64 * 4,
+            size: pad_width  as u64 * backing_height as u64 * 4 * 4,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false
+        });
+
+        let velocity_buffer = device.create_buffer(&wgpu::BufferDescriptor{
+            label: Some("Velocity Buffer"),
+            size: backing_width as u64 * backing_height as u64 * 4 * 2,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false
+        });
+
+        let heat_buffer = device.create_buffer(&wgpu::BufferDescriptor{
+            label: Some("Heat Buffer"),
+            size: backing_width as u64 * backing_height as u64 * 4,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
 
         let secondary_diffuse_storage = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Secondary Diffuse Buffer"),
-            size: pad_width  as u64 * backing_height as u64 * 4,
+            size: pad_width  as u64 * backing_height as u64 * 4 * 4,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false
+        });
+
+        let secondary_velocity_buffer = device.create_buffer(&wgpu::BufferDescriptor{
+            label: Some("Secondary Velocity Buffer"),
+            size: backing_width as u64 * backing_height as u64 * 4 * 2,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false
+        });
+
+        let secondary_heat_buffer = device.create_buffer(&wgpu::BufferDescriptor{
+            label: Some("Secondary Heat Buffer"),
+            size: backing_width as u64 * backing_height as u64 * 4,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
 
@@ -281,9 +339,9 @@ impl<'a> GPU<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm]
+            view_formats: &[wgpu::TextureFormat::Rgba32Float]
         });
 
         let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor { 
@@ -291,8 +349,8 @@ impl<'a> GPU<'a> {
             address_mode_u: wgpu::AddressMode::Repeat, 
             address_mode_v: wgpu::AddressMode::Repeat, 
             address_mode_w: wgpu::AddressMode::Repeat, 
-            mag_filter: wgpu::FilterMode::Linear, 
-            min_filter: wgpu::FilterMode::Linear, 
+            mag_filter: wgpu::FilterMode::Nearest,//Linear, 
+            min_filter: wgpu::FilterMode::Nearest,//Linear, 
             mipmap_filter: wgpu::FilterMode::Nearest, 
             ..Default::default()
         });
@@ -315,24 +373,40 @@ impl<'a> GPU<'a> {
                 wgpu::BindGroupEntry{
                     binding: 0,
                     resource: diffuse_storage.as_entire_binding()
+                },
+                wgpu::BindGroupEntry{
+                    binding: 1,
+                    resource: velocity_buffer.as_entire_binding()
+                },
+                wgpu::BindGroupEntry{
+                    binding: 2,
+                    resource: heat_buffer.as_entire_binding()
                 }
             ] 
         });
 
         let secondary_diffuse_storage_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
             label: Some("Secondary Diffuse Bind Group"), 
-            layout: &secondary_diffuse_storage_group_layout, 
+            layout: &diffuse_storage_group_layout, 
             entries: &[
                 wgpu::BindGroupEntry{
-                    binding: 10,
+                    binding: 0,
                     resource: secondary_diffuse_storage.as_entire_binding()
+                },
+                wgpu::BindGroupEntry{
+                    binding: 1,
+                    resource: secondary_velocity_buffer.as_entire_binding()
+                },
+                wgpu::BindGroupEntry{
+                    binding: 2,
+                    resource: secondary_heat_buffer.as_entire_binding()
                 }
             ] 
         });
 
         let texture_view = diffuse.create_view(&wgpu::TextureViewDescriptor{ 
             label: Some("Texture View"), 
-            format: Some(wgpu::TextureFormat::Rgba8Unorm), 
+            format: Some(wgpu::TextureFormat::Rgba32Float), 
             dimension: Some(wgpu::TextureViewDimension::D2), 
             aspect: wgpu::TextureAspect::All,
             base_mip_level: 0, 
@@ -370,7 +444,8 @@ impl<'a> GPU<'a> {
             pad_height,
 
             render_pipeline,
-            compute_pipeline,
+            diffusion_pipeline,
+            movement_pipeline,
             line_pipeline,
 
             line_group_layout,
@@ -392,34 +467,20 @@ impl<'a> GPU<'a> {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+    fn render(&mut self) {
+        let output = self.surface.get_current_texture().unwrap();
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
-                timestamp_writes: None 
-            });       
-
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
-            compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
-            compute_pass.set_bind_group(2, &self.secondary_diffuse_storage_bind_group, &[]);
-            compute_pass.dispatch_workgroups(self.pad_width/8, self.pad_height/8, 1);
-        }
-
-        encoder.copy_buffer_to_buffer(&self.secondary_diffuse_storage, 0, &self.diffuse_storage, 0, self.pad_width as u64 * self.backing_height as u64 * 4);
 
         encoder.copy_buffer_to_texture(
             wgpu::ImageCopyBufferBase{
                 buffer: &self.diffuse_storage,
                 layout: wgpu::ImageDataLayout{ 
                     offset: 0, 
-                    bytes_per_row: Some(self.pad_width * 4), 
+                    bytes_per_row: Some(self.pad_width * 4 * 4), 
                     rows_per_image: None 
                 }
             },
@@ -474,13 +535,39 @@ impl<'a> GPU<'a> {
         // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-        
-        Ok(())
     }
 
-    fn line(&mut self, line_points: &[Point]) {
+    fn compute(&mut self) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
+            label: Some("Compute Encoder"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+                timestamp_writes: None 
+            });       
+            
+            for _ in 0..40 {
+                compute_pass.set_pipeline(&self.movement_pipeline);
+                compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
+                compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
+                compute_pass.set_bind_group(2, &self.secondary_diffuse_storage_bind_group, &[]);
+                compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+                compute_pass.set_pipeline(&self.diffusion_pipeline);
+                compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
+                compute_pass.set_bind_group(1, &self.secondary_diffuse_storage_bind_group, &[]);
+                compute_pass.set_bind_group(2, &self.diffuse_storage_bind_group, &[]);
+                compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn line(&mut self, line_points: &[Point], color: [f32; 4], velocity: [f32; 2], heat: f32) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Line Encoder"),
         }); 
 
         {
@@ -495,13 +582,28 @@ impl<'a> GPU<'a> {
                 usage: wgpu::BufferUsages::STORAGE
             });
 
+            let mut line_config = [0.0; 8];
+            line_config[0..4].copy_from_slice(&color);
+            line_config[4..6].copy_from_slice(&velocity);
+            line_config[6] = heat;
+
+            let line_config_buffer = self.device.create_buffer_init(&BufferInitDescriptor{
+                label: Some("Line Color Buffer"),
+                contents: bytemuck::cast_slice(&line_config),
+                usage: wgpu::BufferUsages::UNIFORM
+            });
+
             let line_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
                 label: Some("Line Bind Group"),
                 layout: &self.line_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry{
-                        binding: 0,
+                        binding: 10,
                         resource: line_points_buffer.as_entire_binding()
+                    },
+                    wgpu::BindGroupEntry{
+                        binding: 11,
+                        resource: line_config_buffer.as_entire_binding()
                     }
                 ]
             });
@@ -519,8 +621,9 @@ impl<'a> GPU<'a> {
 
 enum GPUCommand {
     Resize{width: u32, height: u32},
-    Render,
-    Line{line_points: Vec<Point>}
+    Compute,
+    ToggleLoop,
+    Line{line_points: Vec<Point>, color: [f32; 4], velocity: [f32; 2], heat: f32}
 }
 
 struct GPUSize {
@@ -534,7 +637,12 @@ struct App {
     idx: usize,
     window_id: Option<WindowId>,
     window: Option<Arc<Window>>,
+
+    mouse_held: bool,
     line_points: Vec<Point>,
+    line_color: [f32; 4],
+    line_velocity: [f32; 2],
+    line_heat: f32,
 
     gpu: Option<mpsc::Sender<GPUCommand>>,
     gpu_size: Option<GPUSize>
@@ -552,14 +660,26 @@ impl winit::application::ApplicationHandler for App {
             self.window = Some(window);
             let (tx,rx) = mpsc::channel();
             std::thread::spawn(move || {
+                let mut compute_loop = false;
                 loop {
-                    match rx.recv() {
-                        Err(_) => {break;}
+                    match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        Err(e) => {
+                            match e {
+                                mpsc::RecvTimeoutError::Disconnected => {break;}
+                                mpsc::RecvTimeoutError::Timeout => {
+                                    if compute_loop {
+                                        gpu.compute();
+                                        gpu.render();
+                                    }
+                                }
+                            }
+                        }
                         Ok(command) => {
                             match command {
-                                GPUCommand::Resize { width, height } => {gpu.resize(width, height)}
-                                GPUCommand::Render => {gpu.render().unwrap()}
-                                GPUCommand::Line { line_points } => {gpu.line(&line_points)}
+                                GPUCommand::Resize { width, height } => {gpu.resize(width, height); gpu.render()}
+                                GPUCommand::Compute => {gpu.compute(); gpu.render()}
+                                GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
+                                GPUCommand::Line { line_points, color , velocity, heat} => {gpu.line(&line_points,color, velocity, heat); gpu.render()}
                             }
                         }
                     }
@@ -612,17 +732,54 @@ impl winit::application::ApplicationHandler for App {
             },  
             WindowEvent::Resized(size) => {
                 self.gpu.as_mut().map(|inner| inner.send(GPUCommand::Resize{width: size.width, height: size.height}));
+                self.gpu_size.as_mut().map(|inner| {inner.surface_width = size.width; inner.surface_height = size.height});
             },
             WindowEvent::KeyboardInput {event, ..} => {
                 match event.logical_key {
                     winit::keyboard::Key::Character(key) => {
-                        if key == "r" && event.state.is_pressed() {
-                            if let Some(gpu) = &mut self.gpu {
-                                if self.line_points.len() > 0 {
-                                    let new_vec = vec![self.line_points[self.line_points.len() -1]];
-                                    gpu.send(GPUCommand::Line{line_points: std::mem::replace(&mut self.line_points, new_vec)}).unwrap();
+                        if event.state.is_pressed() {
+                            match key.as_str() {
+                                "r" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::Compute).unwrap();
+                                    }
                                 }
-                                gpu.send(GPUCommand::Render).unwrap();
+                                "f" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::ToggleLoop).unwrap();
+                                    }
+                                }
+                                "1" => {
+                                    self.line_color[0] = 1.0 - self.line_color[0];
+                                }
+                                "2" => {
+                                    self.line_color[1] = 1.0 - self.line_color[1];
+                                }
+                                "3" => {
+                                    self.line_color[2] = 1.0 - self.line_color[2];
+                                }
+                                "4" => {
+                                    println!("Enter X Velocity: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    self.line_velocity[0] = input.parse::<f32>().unwrap();
+                                }
+                                "5" => {
+                                    println!("Enter Y Velocity: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    self.line_velocity[1] = input.parse::<f32>().unwrap();
+                                }
+                                "6" => {
+                                    println!("Enter Heat: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    self.line_heat = input.parse::<f32>().unwrap();
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -631,16 +788,37 @@ impl winit::application::ApplicationHandler for App {
             }
             WindowEvent::CursorMoved {position, ..} => {
                 if let Some(size) = &self.gpu_size {
-                    let x = position.x * size.backing_width as f64 / size.surface_width as f64;
-                    let y = position.y * size.backing_height as f64 / size.surface_height as f64;
-                    self.line_points.push(Point(x as u32, y as u32));
+                    if self.mouse_held {
+                        let x = position.x * size.backing_width as f64 / size.surface_width as f64;
+                        let y = position.y * size.backing_height as f64 / size.surface_height as f64;
+                        self.line_points.push(Point(x as u32, y as u32));
+                    }
+                }
+            }
+            WindowEvent::MouseInput {state, button , ..} => {
+                match button {
+                    MouseButton::Left => {
+                        match state {
+                            ElementState::Pressed => {self.mouse_held = true},
+                            ElementState::Released => {
+                                self.mouse_held = false;
+                                if let Some(gpu) = &self.gpu {
+                                    gpu.send(GPUCommand::Line{
+                                        line_points: std::mem::replace(&mut self.line_points, Vec::new()), 
+                                        color: self.line_color, 
+                                        velocity: self.line_velocity,
+                                        heat: self.line_heat
+                                    }).unwrap();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => (),
         }
     }
-
-    
 }
 
 fn main() {
@@ -649,7 +827,21 @@ fn main() {
 
 
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App{idx: 0, window_id: None, window: None, line_points: Vec::new(), gpu: None, gpu_size: None};
+    let mut app = App{
+        idx: 0, 
+        window_id: None, 
+        window: None, 
+
+        mouse_held: false,
+        line_points: Vec::new(), 
+        line_color: [1.0,1.0,1.0,1.0], 
+        line_velocity: [0.0, 0.0],
+        line_heat: 0.0,
+
+        gpu: None, 
+        gpu_size: None
+    };
     event_loop.run_app(&mut app).unwrap();
+    println!("test");
 }
 
