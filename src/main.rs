@@ -20,6 +20,10 @@ fn pad(x: u32, pad: u32) -> u32 {
     }
 }
 
+fn round_up_div(dividend: u64, divisor: u64) -> u64 {
+    ((dividend -1) / divisor) + 1
+}
+
 #[repr(C)]
 #[derive(Clone,Copy,bytemuck::Zeroable,bytemuck::Pod)]
 struct Point(u32,u32);
@@ -52,6 +56,7 @@ struct GPU<'a> {
     size_bind_group: wgpu::BindGroup,
     diffuse_storage_bind_group: wgpu::BindGroup,
     secondary_diffuse_storage_bind_group: wgpu::BindGroup,
+    wall_buffer_bind_group: wgpu::BindGroup,
     fragment_bind_group: wgpu::BindGroup
 }
 
@@ -139,6 +144,22 @@ impl<'a> GPU<'a> {
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
                         min_binding_size: None 
+                    },
+                    count: None
+                }
+            ]
+        });
+
+        let wall_buffer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+            label: Some("Wall Buffer Layout"), 
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: None
                     },
                     count: None
                 }
@@ -242,7 +263,7 @@ impl<'a> GPU<'a> {
 
         let diffusion_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Diffusion Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&wall_buffer_layout],
             push_constant_ranges: &[]
         });
 
@@ -257,7 +278,7 @@ impl<'a> GPU<'a> {
 
         let movement_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Movement Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&wall_buffer_layout],
             push_constant_ranges: &[]
         });
 
@@ -333,6 +354,13 @@ impl<'a> GPU<'a> {
             mapped_at_creation: false
         });
 
+        let wall_buffer = device.create_buffer(&wgpu::BufferDescriptor{
+            label: Some("Wall Buffer"),
+            size: round_up_div(backing_width as u64 * backing_height as u64, 32), //stored as a bit array which is truly [u32]
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false
+        });
+
         let diffuse = device.create_texture(&wgpu::TextureDescriptor{
             label: Some("Diffuse"),
             size: wgpu::Extent3d { width: backing_width, height: backing_height, depth_or_array_layers: 1 },
@@ -404,6 +432,17 @@ impl<'a> GPU<'a> {
             ] 
         });
 
+        let wall_buffer_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Wall Bind Group"),
+            layout: &wall_buffer_layout,
+            entries: &[
+                wgpu::BindGroupEntry{
+                    binding: 0,
+                    resource: wall_buffer.as_entire_binding()
+                }
+            ]
+        });
+
         let texture_view = diffuse.create_view(&wgpu::TextureViewDescriptor{ 
             label: Some("Texture View"), 
             format: Some(wgpu::TextureFormat::Rgba32Float), 
@@ -457,6 +496,7 @@ impl<'a> GPU<'a> {
             size_bind_group,
             diffuse_storage_bind_group,
             secondary_diffuse_storage_bind_group,
+            wall_buffer_bind_group,
             fragment_bind_group
         }
     }
@@ -548,16 +588,18 @@ impl<'a> GPU<'a> {
                 timestamp_writes: None 
             });       
             
-            for _ in 0..40 {
+            for _ in 0..1 {
                 compute_pass.set_pipeline(&self.movement_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.secondary_diffuse_storage_bind_group, &[]);
+                compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
                 compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
                 compute_pass.set_pipeline(&self.diffusion_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.secondary_diffuse_storage_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.diffuse_storage_bind_group, &[]);
+                compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
                 compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
             }
         }
@@ -685,6 +727,20 @@ impl winit::application::ApplicationHandler for App {
                     }
                 }
             });
+            let mut block_points = Vec::new();
+            for i in 0..100 {
+                block_points.push(Point(300,200+2*i));
+                block_points.push(Point(500,200+2*i));
+                block_points.push(Point(500,200+2*i+1));
+                block_points.push(Point(300,200+2*i+1));
+            }
+            block_points.push(Point(299,399));
+            tx.send(GPUCommand::Line{
+                line_points: block_points, 
+                color: self.line_color, 
+                velocity: self.line_velocity,
+                heat: self.line_heat
+            }).unwrap();
             self.gpu = Some(tx);
             self.gpu_size = Some(GPUSize{
                 surface_width: size.width, 
@@ -836,7 +892,7 @@ fn main() {
         line_points: Vec::new(), 
         line_color: [1.0,1.0,1.0,1.0], 
         line_velocity: [0.0, 0.0],
-        line_heat: 0.0,
+        line_heat: 0.5,
 
         gpu: None, 
         gpu_size: None

@@ -17,6 +17,7 @@
 @group(2) @binding(11) var<uniform> line_config: LineConfig;
 
 
+@group(3) @binding(0) var<storage,read_write> wall_buffer: array<u32>;
 
 struct Size {
     backing_width: u32,
@@ -83,6 +84,19 @@ fn index_2d(point: vec2<u32>) -> u32 {
     return point.x + size.backing_width * point.y;
 }
 
+fn wall_buffer_get_2d(point: vec2<u32>) -> bool {
+    let index = index_2d(point);
+    return bool((wall_buffer[index / 8] >> (index % 8)) & 0x00000001);
+}
+
+fn wall_buffer_set_2d(point: vec2<u32>, val: bool) {
+    let index = index_2d(point);
+    let arr_index = index / 8;
+    let shifted_val = u32(val) << (index % 8);
+    wall_buffer[arr_index] &= (shifted_val ^ 0x11111111); // set targetted bit to 0
+    wall_buffer[arr_index] |= shifted_val; //set targetted bit to val
+}
+
 fn total_diffuse(diffuse: vec4<f32>) -> f32 {
     return diffuse.x + diffuse.y + diffuse.z;
 } 
@@ -90,6 +104,11 @@ fn total_diffuse(diffuse: vec4<f32>) -> f32 {
 fn magnitude(velocity: vec2<f32>) -> f32 {
     return sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
 }
+
+fn sum(vector: vec2<f32>) -> f32 {
+    return vector.x + vector.y;
+}
+
 
 @compute
 @workgroup_size(8,8)
@@ -102,107 +121,110 @@ fn diffusion_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let base_location = vec2<i32>(i32(global_id.x),i32(global_id.y)) + dimensions;
 
     var aggregate_diffuse = vec4(0.0,0.0,0.0,0.0);
-    var aggregate_velocity = vec2(0.0,0.0);
-    var expected_velocity_energy = 0.0;
+    var aggregate_velocity_energy = vec2(0.0,0.0);
+    var expected_velocity_energy = vec2(0.0,0.0);
     var aggregate_heat = 0.0;
 
-    var location = vec2<u32>((base_location + vec2(-1,-1)) % dimensions);
-    var heat = heat_buffer[index_2d(location)];
-    var new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * heat) / 16.0);
-    var diffuse_total = total_diffuse(new_diffuse);
+    var location = vec2<u32>(0u,0u);
+    var heat = 0.0;
+    var new_diffuse = vec4(0.0,0.0,0.0,0.0);
+    var diffuse_total = 0.0;
+    var velocity = vec2(0.0,0.0);
+
+    location = vec2<u32>((base_location + vec2(-1,-1)) % dimensions);
+    heat = heat_buffer[index_2d(location)];
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
+    diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    var velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(inverseSqrt(2.0),inverseSqrt(2.0)) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + vec2(inverseSqrt(2.0),inverseSqrt(2.0)) * sqrt(heat);
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,0)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * (1.0 + sqrt(2.0) - heat)) / 8.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(1.0,0.0) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + ((vec2(1.0,0.0) * heat) + (vec2(inverseSqrt(2.0),0.0) * sqrt(heat)) * (sqrt(2.0 * heat) - heat)); // can be simplified
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
+    aggregate_heat += inverseSqrt(2.0) * heat * (sqrt(2.0 * heat) - heat) * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,1)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * heat) / 16.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(inverseSqrt(2.0),-inverseSqrt(2.0)) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + vec2(inverseSqrt(2.0),-inverseSqrt(2.0)) * sqrt(heat);
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,-1)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * (1.0 + sqrt(2.0) - heat)) / 8.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(0.0,1.0) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + ((vec2(0.0,1.0) * heat) + (vec2(0.0,inverseSqrt(2.0)) * sqrt(heat)) * (sqrt(2.0 * heat) - heat)); // can be simplified
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
+    aggregate_heat += inverseSqrt(2.0) * heat * (sqrt(2.0 * heat) - heat) * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,0)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((4.0 - heat * (2.0 + 2.0 * sqrt(2.0) - heat)) / 4.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((4.0 - sqrt(heat) * (2.0 + 2.0 * sqrt(2.0)) + heat) / 4.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
     velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,1)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * (1.0 + sqrt(2.0) - heat)) / 8.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(0.0,-1.0) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + ((vec2(0.0,-1.0) * heat) + (vec2(0.0,-inverseSqrt(2.0)) * sqrt(heat)) * (sqrt(2.0 * heat) - heat)); // can be simplified
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
+    aggregate_heat += inverseSqrt(2.0) * heat * (sqrt(2.0 * heat) - heat) * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,-1)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * heat) / 16.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(-inverseSqrt(2.0),inverseSqrt(2.0)) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + vec2(-inverseSqrt(2.0),inverseSqrt(2.0)) * sqrt(heat);
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,0)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * (1.0 + sqrt(2.0) - heat)) / 8.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(-1.0,0.0) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + ((vec2(-1.0,0.0) * heat) + (vec2(-inverseSqrt(2.0),0.0) * sqrt(heat)) * (sqrt(2.0 * heat) - heat)); // can be simplified
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
+    aggregate_heat += inverseSqrt(2.0) * heat * (sqrt(2.0 * heat) - heat) * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,1)) % dimensions);
     heat = heat_buffer[index_2d(location)];
-    new_diffuse = diffuse_storage[pad_index_2d(location)] * ((heat * heat) / 16.0);
+    new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
-    aggregate_velocity += (velocity + vec2(-inverseSqrt(2.0),-inverseSqrt(2.0)) * heat) * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
-    aggregate_heat += heat * diffuse_total;
+    velocity = velocity_buffer[index_2d(location)] + vec2(-inverseSqrt(2.0),-inverseSqrt(2.0)) * sqrt(heat);
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total;
+    expected_velocity_energy += velocity * velocity * diffuse_total;
+    
 
 
     location = vec2<u32>((base_location % dimensions));
     diffuse_total = total_diffuse(aggregate_diffuse);
     secondary_diffuse_storage[pad_index_2d(location)] = aggregate_diffuse;
     if diffuse_total > 0.0 {
-        secondary_velocity_buffer[index_2d(location)] = aggregate_velocity / diffuse_total;
-        secondary_heat_buffer[index_2d(location)] = max(aggregate_heat / diffuse_total + (expected_velocity_energy / diffuse_total) - magnitude(aggregate_velocity / diffuse_total),0.0); // discreprency between real & expected vel energy becomes Heat
+        secondary_velocity_buffer[index_2d(location)] = clamp(sign(aggregate_velocity_energy) * sqrt(abs(aggregate_velocity_energy / diffuse_total)),vec2(-1.0,-1.0),vec2(1.0,1.0));
+        secondary_heat_buffer[index_2d(location)] = clamp((aggregate_heat + sum(expected_velocity_energy - abs(aggregate_velocity_energy))) / diffuse_total,0.0,1.0); // discreprency between real & expected vel energy becomes Heat
     } else {
         secondary_velocity_buffer[index_2d(location)] = vec2(0.0,0.0);
         secondary_heat_buffer[index_2d(location)] = 0.0;
@@ -221,8 +243,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let base_location = vec2<i32>(i32(global_id.x),i32(global_id.y)) + dimensions;
 
     var aggregate_diffuse = vec4(0.0,0.0,0.0,0.0);
-    var aggregate_velocity = vec2(0.0,0.0);
-    var expected_velocity_energy = 0.0;
+    var aggregate_velocity_energy = vec2(0.0,0.0);
+    var expected_velocity_energy = vec2(0.0,0.0);
     var aggregate_heat = 0.0;
 
     var location = vec2<u32>((base_location + vec2(-1,-1)) % dimensions);
@@ -230,8 +252,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(velocity.x,0.0) * max(velocity.y,0.0));
     var diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,0)) % dimensions);
@@ -239,8 +261,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(velocity.x,0.0) * (1.0 - abs(velocity.y)));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,1)) % dimensions);
@@ -248,8 +270,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(velocity.x,0.0) * max(-velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,-1)) % dimensions);
@@ -257,8 +279,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((1.0 - abs(velocity.x)) * max(velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,0)) % dimensions);
@@ -266,8 +288,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((1.0 - abs(velocity.x)) * (1.0 - abs(velocity.y)));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,1)) % dimensions);
@@ -275,8 +297,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((1.0 - abs(velocity.x)) * max(-velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,-1)) % dimensions);
@@ -284,8 +306,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(-velocity.x,0.0) * max(velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,0)) % dimensions);
@@ -293,8 +315,8 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(-velocity.x,0.0) * (1.0 - abs(velocity.y)));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,1)) % dimensions);
@@ -302,22 +324,20 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(-velocity.x,0.0) * max(-velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    aggregate_velocity += velocity * diffuse_total;
-    expected_velocity_energy += magnitude(velocity) * diffuse_total;
+    aggregate_velocity_energy += velocity * abs(velocity) * diffuse_total; // signed square
+    expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
-
-
+    
     location = vec2<u32>((base_location % dimensions));
     diffuse_total = total_diffuse(aggregate_diffuse);
     secondary_diffuse_storage[pad_index_2d(location)] = aggregate_diffuse;
     if diffuse_total > 0.0 {
-        secondary_velocity_buffer[index_2d(location)] = aggregate_velocity / diffuse_total;
-        secondary_heat_buffer[index_2d(location)] = max(aggregate_heat / diffuse_total + (expected_velocity_energy / diffuse_total) - magnitude(aggregate_velocity / diffuse_total),0.0); // discreprency between real & expected vel energy becomes Heat
+        secondary_velocity_buffer[index_2d(location)] = clamp(sign(aggregate_velocity_energy) * sqrt(abs(aggregate_velocity_energy / diffuse_total)),vec2(-1.0,-1.0),vec2(1.0,1.0));
+        secondary_heat_buffer[index_2d(location)] = clamp((aggregate_heat + sum(expected_velocity_energy - abs(aggregate_velocity_energy))) / diffuse_total,0.0,1.0); // discreprency between real & expected vel energy becomes Heat
     } else {
         secondary_velocity_buffer[index_2d(location)] = vec2(0.0,0.0);
         secondary_heat_buffer[index_2d(location)] = 0.0;
     }
-    
 }
 
 
