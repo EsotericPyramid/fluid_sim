@@ -588,7 +588,7 @@ impl<'a> GPU<'a> {
                 timestamp_writes: None 
             });       
             
-            for _ in 0..1 {
+            for _ in 0..30 {
                 compute_pass.set_pipeline(&self.movement_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
@@ -727,20 +727,6 @@ impl winit::application::ApplicationHandler for App {
                     }
                 }
             });
-            let mut block_points = Vec::new();
-            for i in 0..100 {
-                block_points.push(Point(300,200+2*i));
-                block_points.push(Point(500,200+2*i));
-                block_points.push(Point(500,200+2*i+1));
-                block_points.push(Point(300,200+2*i+1));
-            }
-            block_points.push(Point(299,399));
-            tx.send(GPUCommand::Line{
-                line_points: block_points, 
-                color: self.line_color, 
-                velocity: self.line_velocity,
-                heat: self.line_heat
-            }).unwrap();
             self.gpu = Some(tx);
             self.gpu_size = Some(GPUSize{
                 surface_width: size.width, 
@@ -892,7 +878,7 @@ fn main() {
         line_points: Vec::new(), 
         line_color: [1.0,1.0,1.0,1.0], 
         line_velocity: [0.0, 0.0],
-        line_heat: 0.5,
+        line_heat: 0.0,
 
         gpu: None, 
         gpu_size: None

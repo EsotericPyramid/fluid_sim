@@ -73,7 +73,10 @@ fn vs_main(
 
 @fragment
 fn fs_main(position: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(diffuse,texture_sampler,position.tex_coords);
+    let full_base_diffuse = textureSample(diffuse,texture_sampler,position.tex_coords);
+    var base_diffuse = vec3(full_base_diffuse.r,full_base_diffuse.g,full_base_diffuse.b);
+    base_diffuse = 1.0 - exp2(-base_diffuse);
+    return vec4(base_diffuse,1.0);
 }
 
 fn pad_index_2d(point: vec2<u32>) -> u32 {
