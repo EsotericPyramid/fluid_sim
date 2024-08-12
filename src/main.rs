@@ -588,7 +588,7 @@ impl<'a> GPU<'a> {
                 timestamp_writes: None 
             });       
             
-            for _ in 0..30 {
+            for _ in 0..1 {
                 compute_pass.set_pipeline(&self.movement_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
