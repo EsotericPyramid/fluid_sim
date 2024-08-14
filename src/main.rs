@@ -588,7 +588,7 @@ impl<'a> GPU<'a> {
                 timestamp_writes: None 
             });       
             
-            for _ in 0..1 {
+            for _ in 0..30 {
                 compute_pass.set_pipeline(&self.movement_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
@@ -694,7 +694,7 @@ impl winit::application::ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
-        } else {
+        } else if !event_loop.exiting() {
             let window = Arc::new(event_loop.create_window(Window::default_attributes()).unwrap());
             window.set_max_inner_size(Some(PhysicalSize{width: 2048, height: 2048}));
             let size = window.inner_size();

@@ -230,7 +230,7 @@ fn diffusion_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if diffuse_total > 0.0 {
         aggregate_velocity = clamp(aggregate_velocity / diffuse_total,vec2(-1.0,-1.0),vec2(1.0,1.0)); // clamped because I **BELIEVE** that it can be pushed to inifinite speeds at ~0 mass fringes
         secondary_velocity_buffer[index_2d(location)] = aggregate_velocity;
-        secondary_heat_buffer[index_2d(location)] = clamp((aggregate_heat  / diffuse_total + sum(expected_velocity_energy  / diffuse_total - aggregate_velocity * aggregate_velocity)),0.0,1.0); // discreprency between real & expected vel energy becomes Heat
+        secondary_heat_buffer[index_2d(location)] = clamp((aggregate_heat  / diffuse_total + sum(expected_velocity_energy  / diffuse_total - aggregate_velocity * aggregate_velocity)) / 2.0,0.0,1.0); // discreprency between real & expected vel energy becomes Heat
     } else {
         secondary_velocity_buffer[index_2d(location)] = vec2(0.0,0.0);
         secondary_heat_buffer[index_2d(location)] = 0.0;
@@ -340,7 +340,7 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if diffuse_total > 0.0 {
         aggregate_velocity /= diffuse_total;
         secondary_velocity_buffer[index_2d(location)] = aggregate_velocity;
-        secondary_heat_buffer[index_2d(location)] = clamp((aggregate_heat  / diffuse_total + sum(expected_velocity_energy  / diffuse_total - aggregate_velocity * aggregate_velocity)),0.0,1.0); // discreprency between real & expected vel energy becomes Heat
+        secondary_heat_buffer[index_2d(location)] = clamp((aggregate_heat  / diffuse_total + sum(expected_velocity_energy  / diffuse_total - aggregate_velocity * aggregate_velocity) / 2.0),0.0,1.0); // discreprency between real & expected vel energy becomes Heat
     } else {
         secondary_velocity_buffer[index_2d(location)] = vec2(0.0,0.0);
         secondary_heat_buffer[index_2d(location)] = 0.0;
