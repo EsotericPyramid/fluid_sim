@@ -102,6 +102,7 @@ fn wall_buffer_set_2d(point: vec2<u32>, val: bool) {
     wall_buffer[arr_index] |= shifted_val; //set targetted bit to val
 }
 
+//make sure to keep in sync with util_shader.wgsl
 fn total_diffuse(diffuse: vec4<f32>) -> f32 {
     return diffuse.x + diffuse.y + diffuse.z;
 } 

@@ -20,7 +20,11 @@ fn pad(x: u32, pad: u32) -> u32 {
     }
 }
 
-fn round_up_div(dividend: u64, divisor: u64) -> u64 {
+fn round_up_div_u64(dividend: u64, divisor: u64) -> u64 {
+    ((dividend -1) / divisor) + 1
+}
+
+fn round_up_div_u32(dividend: u32, divisor: u32) -> u32 {
     ((dividend -1) / divisor) + 1
 }
 
@@ -46,16 +50,26 @@ struct GPU<'a> {
     diffusion_pipeline: wgpu::ComputePipeline,
     movement_pipeline: wgpu::ComputePipeline,
     line_pipeline: wgpu::ComputePipeline,
+    // diagnostic util pipelines
+    half_sum_pipeline: wgpu::ComputePipeline,
+    square_pipeline: wgpu::ComputePipeline,
+    diffusion_scale_pipeline: wgpu::ComputePipeline,
 
     line_group_layout: wgpu::BindGroupLayout,
+    util_buffer_group_layout: wgpu::BindGroupLayout,
+    half_sum_group_layout: wgpu::BindGroupLayout,
 
     diffuse_storage: wgpu::Buffer,
+    velocity_buffer: wgpu::Buffer,
+    heat_buffer: wgpu::Buffer,
     secondary_diffuse_storage: wgpu::Buffer,
+    secondary_velocity_buffer: wgpu::Buffer,
+    secondary_heat_buffer: wgpu::Buffer,
     diffuse: wgpu::Texture,
 
     size_bind_group: wgpu::BindGroup,
-    diffuse_storage_bind_group: wgpu::BindGroup,
-    secondary_diffuse_storage_bind_group: wgpu::BindGroup,
+    gas_data_bind_group: wgpu::BindGroup,
+    secondary_gas_data_bind_group: wgpu::BindGroup,
     wall_buffer_bind_group: wgpu::BindGroup,
     fragment_bind_group: wgpu::BindGroup
 }
@@ -96,7 +110,8 @@ impl<'a> GPU<'a> {
         };
         surface.configure(&device, &surface_config);
     
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let sim_shader = device.create_shader_module(wgpu::include_wgsl!("sim_shader.wgsl"));
+        let util_shader = device.create_shader_module(wgpu::include_wgsl!("util_shader.wgsl"));
 
         let size_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Size Group Layout"),
@@ -213,6 +228,38 @@ impl<'a> GPU<'a> {
                 }
             ]
         });
+
+        let util_buffer_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Util Buffer Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: None 
+                    },
+                    count: None
+                }
+            ]
+        });
+
+        let half_sum_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Half Sum Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer{
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None
+                    },
+                    count: None
+                }
+            ]
+        });
     
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
@@ -224,13 +271,13 @@ impl<'a> GPU<'a> {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &sim_shader,
                 entry_point: "vs_main", // 1.
                 buffers: &[], // 2.
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState { // 3.
-                module: &shader,
+                module: &sim_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState { // 4.
                     format: surface_config.format,
@@ -270,7 +317,7 @@ impl<'a> GPU<'a> {
         let diffusion_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
             label: Some("Diffusion Pipeline"),
             layout: Some(&diffusion_pipeline_layout),
-            module: &shader,
+            module: &sim_shader,
             entry_point: "diffusion_main",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None
@@ -285,7 +332,7 @@ impl<'a> GPU<'a> {
         let movement_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
             label: Some("Movement Pipeline"),
             layout: Some(&movement_pipeline_layout),
-            module: &shader,
+            module: &sim_shader,
             entry_point: "movement_main",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None
@@ -300,8 +347,53 @@ impl<'a> GPU<'a> {
         let line_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
             label: Some("Line Pipeline"),
             layout: Some(&line_pipeline_layout),
-            module: &shader,
+            module: &sim_shader,
             entry_point: "line_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None
+        });
+
+        let half_sum_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
+            label: Some("Half Sum Pipeline Layout"),
+            bind_group_layouts: &[&util_buffer_group_layout,&half_sum_group_layout],
+            push_constant_ranges: &[]
+        });
+
+        let half_sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+            label: Some("Half Sum Pipeline"),
+            layout: Some(&half_sum_pipeline_layout),
+            module: &util_shader,
+            entry_point: "half_sum",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None
+        });
+
+        let util_pipelines_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
+            label: Some("Util Pipelines Layout"),
+            bind_group_layouts: &[&util_buffer_group_layout],
+            push_constant_ranges: &[]
+        });
+
+        let square_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+            label: Some("Square Pipeline"),
+            layout: Some(&util_pipelines_layout),
+            module: &util_shader,
+            entry_point: "square_arr",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None
+        });
+
+        let diffusion_scale_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
+            label: Some("Diffusion Scale Pipeline Layout"),
+            bind_group_layouts: &[&util_buffer_group_layout,&util_buffer_group_layout,&size_group_layout],
+            push_constant_ranges: &[]
+        });
+
+        let diffusion_scale_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+            label: Some("Diffusion Scale Pipeline"),
+            layout: Some(&diffusion_scale_pipeline_layout),
+            module: &util_shader,
+            entry_point: "diffusion_scale",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None
         });
@@ -336,7 +428,7 @@ impl<'a> GPU<'a> {
         let secondary_diffuse_storage = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Secondary Diffuse Buffer"),
             size: pad_width  as u64 * backing_height as u64 * 4 * 4,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
 
@@ -356,7 +448,7 @@ impl<'a> GPU<'a> {
 
         let wall_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Wall Buffer"),
-            size: round_up_div(backing_width as u64 * backing_height as u64, 32), //stored as a bit array which is truly [u32]
+            size: round_up_div_u64(backing_width as u64 * backing_height as u64, 32), //stored as a bit array which is truly [u32]
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
@@ -394,7 +486,7 @@ impl<'a> GPU<'a> {
             ]
         });
 
-        let diffuse_storage_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
+        let gas_data_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
             label: Some("Compute Bind Group"), 
             layout: &diffuse_storage_group_layout, 
             entries: &[
@@ -413,7 +505,7 @@ impl<'a> GPU<'a> {
             ] 
         });
 
-        let secondary_diffuse_storage_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
+        let secondary_gas_data_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
             label: Some("Secondary Diffuse Bind Group"), 
             layout: &diffuse_storage_group_layout, 
             entries: &[
@@ -487,15 +579,25 @@ impl<'a> GPU<'a> {
             movement_pipeline,
             line_pipeline,
 
+            half_sum_pipeline,
+            square_pipeline,
+            diffusion_scale_pipeline,
+
             line_group_layout,
+            util_buffer_group_layout,
+            half_sum_group_layout,
             
             diffuse_storage,
+            velocity_buffer,
+            heat_buffer,
             secondary_diffuse_storage,
+            secondary_velocity_buffer,
+            secondary_heat_buffer,
             diffuse,
             
             size_bind_group,
-            diffuse_storage_bind_group,
-            secondary_diffuse_storage_bind_group,
+            gas_data_bind_group,
+            secondary_gas_data_bind_group,
             wall_buffer_bind_group,
             fragment_bind_group
         }
@@ -542,7 +644,7 @@ impl<'a> GPU<'a> {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[
-                    // This is what @location(0) in the fragment shader targets
+                    // This is what @location(0) in the fragment sim_shader targets
                     Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
@@ -567,7 +669,7 @@ impl<'a> GPU<'a> {
             // NEW!
             render_pass.set_pipeline(&self.render_pipeline); // 2.
             render_pass.set_bind_group(0, &self.size_bind_group, &[]);
-            //render_pass.set_bind_group(1, &diffuse_storage_bind_group, &[]);
+            //render_pass.set_bind_group(1, &gas_data_bind_group, &[]);
             render_pass.set_bind_group(1, &self.fragment_bind_group, &[]);
             render_pass.draw(0..6, 0..1); // 3.
         }
@@ -588,17 +690,17 @@ impl<'a> GPU<'a> {
                 timestamp_writes: None 
             });       
             
-            for _ in 0..30 {
+            for _ in 0..60 {
                 compute_pass.set_pipeline(&self.movement_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
-                compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
-                compute_pass.set_bind_group(2, &self.secondary_diffuse_storage_bind_group, &[]);
+                compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
+                compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
                 compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
                 compute_pass.set_pipeline(&self.diffusion_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
-                compute_pass.set_bind_group(1, &self.secondary_diffuse_storage_bind_group, &[]);
-                compute_pass.set_bind_group(2, &self.diffuse_storage_bind_group, &[]);
+                compute_pass.set_bind_group(1, &self.secondary_gas_data_bind_group, &[]);
+                compute_pass.set_bind_group(2, &self.gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
                 compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
             }
@@ -652,12 +754,167 @@ impl<'a> GPU<'a> {
 
             compute_pass.set_pipeline(&self.line_pipeline);
             compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
-            compute_pass.set_bind_group(1, &self.diffuse_storage_bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &line_bind_group, &[]);
             compute_pass.dispatch_workgroups(pad(line_points.len() as u32 -1,64), 1, 1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn sum_buffer(&self, mut pass: wgpu::ComputePass, buffer: &wgpu::BindGroup, block_size: u32) {
+        let mut chunk_size = 1;
+        while chunk_size < self.backing_width * self.backing_height {
+            let half_sum_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+                label: Some("Half Sum Buffer"),
+                contents: bytemuck::cast_slice(&[block_size,chunk_size]),
+                usage: wgpu::BufferUsages::UNIFORM
+            });
+            chunk_size *= 2;
+
+            let half_sum_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Half Sum Bing Group"),
+                layout: &self.half_sum_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry{
+                        binding: 10,
+                        resource: half_sum_buffer.as_entire_binding()
+                    }
+                ]
+            });
+
+            pass.set_pipeline(&self.half_sum_pipeline);
+            pass.set_bind_group(0, buffer, &[]);
+            pass.set_bind_group(1, &half_sum_bind_group, &[]);
+            pass.dispatch_workgroups(round_up_div_u32(self.backing_width * self.backing_height, chunk_size *  64), 1, 1);
+        }
+    }
+
+    fn print_diagnostics(&self) {
+        let staging_buffer = Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor{
+            label: Some("Diagnostic Staging Buffer"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false
+        }));
+
+        let diffuse_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor{
+            label: Some("Diagnostic Diffuse Bind Group"),
+            layout: &self.util_buffer_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry{
+                    binding: 0,
+                    resource: self.secondary_diffuse_storage.as_entire_binding()
+                }
+            ]
+        });
+
+        let velocity_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor{
+            label: Some("Diagnostic Velocity Bind Group"),
+            layout: &self.util_buffer_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry{
+                    binding: 0,
+                    resource: self.secondary_velocity_buffer.as_entire_binding()
+                }
+            ]
+        });
+
+        let heat_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor{
+            label: Some("Diagnostic Heat Bind Group"),
+            layout: &self.util_buffer_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry{
+                    binding: 0,
+                    resource: self.secondary_heat_buffer.as_entire_binding()
+                }
+            ]
+        });
+
+        for i in 0..4 {
+            let (active_bind_group, active_buffer, main_buffer ,size, block_size)= match i {
+                0 | 1 => (&velocity_bind_group, &self.secondary_velocity_buffer,&self.velocity_buffer,(self.backing_width, self.backing_height),2),
+                2 => (&heat_bind_group, &self.secondary_heat_buffer,&self.heat_buffer,(self.backing_width, self.backing_height),1),
+                3 => (&diffuse_bind_group, &self.secondary_diffuse_storage,&self.diffuse_storage,(self.backing_width, self.backing_height),4),
+                _ => panic!("Error invalid i")
+            };  
+
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Diagnostic Encoder"),
+            });
+
+            if i == 0 {
+                encoder.copy_buffer_to_buffer(
+                    &self.diffuse_storage,
+                    0,
+                    &self.secondary_diffuse_storage,
+                    0,
+                    self.pad_width as u64 * self.backing_height as u64 * 4 * 4
+                );
+            }
+
+            if i != 3 {
+                encoder.copy_buffer_to_buffer(
+                    main_buffer,
+                    0,
+                    active_buffer, 
+                    0, 
+                    size.0 as u64 * size.1 as u64 * block_size * 4
+                );
+            }
+            
+    
+        
+            let mut diagnostic_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor{
+                label: Some("Diagnostic Pass"),
+                timestamp_writes: None
+            });
+            
+            if i == 1 { // KE run
+                diagnostic_pass.set_pipeline(&self.square_pipeline);
+                diagnostic_pass.set_bind_group(0, &velocity_bind_group, &[]);
+                diagnostic_pass.dispatch_workgroups(round_up_div_u32(self.backing_width * self.backing_height * 2,64), 1, 1);
+            }
+            if i != 3 {
+                diagnostic_pass.set_pipeline(&self.diffusion_scale_pipeline);
+                diagnostic_pass.set_bind_group(0, active_bind_group, &[]);
+                diagnostic_pass.set_bind_group(1, &diffuse_bind_group, &[]);
+                diagnostic_pass.set_bind_group(2, &self.size_bind_group, &[]);
+                diagnostic_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+            }
+            self.sum_buffer(diagnostic_pass, active_bind_group, block_size as u32);
+    
+            encoder.copy_buffer_to_buffer(
+                active_buffer, 
+                0, 
+                &staging_buffer, 
+                0, 
+                block_size * 4
+            );
+            
+            self.queue.submit(std::iter::once(encoder.finish()));
+            
+            let buffer_clone = staging_buffer.clone();
+            let (tx,rx) = mpsc::channel();
+            staging_buffer.slice(0..(block_size * 4)).map_async(wgpu::MapMode::Read, move |res| tx.send(res).unwrap());
+            self.device.poll(wgpu::Maintain::Wait);
+    
+            if let Ok(res) = rx.recv() {
+                res.map_err(|err| {println!("{}",err)}).unwrap();
+                let view = buffer_clone.slice(0..(block_size * 4)).get_mapped_range();
+                let vec: &[f32] = bytemuck::cast_slice(&view);
+                match i {
+                    0 => println!("Momentum: x: {}, y: {}",vec[0],vec[1]),
+                    1 => println!("KE        x: {}, y: {}",vec[0] / 2.0,vec[1] / 2.0),
+                    2 => println!("Heat:        {}",vec[0]),
+                    3 => println!("Diffuse   R: {}, G: {}, B: {}, A: {}",vec[0],vec[1],vec[2],vec[3]),
+                    _ => panic!("Error: invalid i")
+                }
+                drop(view);
+                buffer_clone.unmap();
+            }
+        }
+    
     }
 }
 
@@ -665,7 +922,8 @@ enum GPUCommand {
     Resize{width: u32, height: u32},
     Compute,
     ToggleLoop,
-    Line{line_points: Vec<Point>, color: [f32; 4], velocity: [f32; 2], heat: f32}
+    Line{line_points: Vec<Point>, color: [f32; 4], velocity: [f32; 2], heat: f32},
+    Diagnostic,
 }
 
 struct GPUSize {
@@ -700,6 +958,13 @@ impl winit::application::ApplicationHandler for App {
             let size = window.inner_size();
             let mut gpu = pollster::block_on(GPU::new(window.clone(),size.width,size.height));
             self.window = Some(window);
+            gpu.line(&[
+                Point(300,200),
+                Point(500,200),
+                Point(500,400),
+                Point(300,400),
+                Point(300,200)
+            ], self.line_color, self.line_velocity, self.line_heat);
             let (tx,rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let mut compute_loop = false;
@@ -722,6 +987,7 @@ impl winit::application::ApplicationHandler for App {
                                 GPUCommand::Compute => {gpu.compute(); gpu.render()}
                                 GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
                                 GPUCommand::Line { line_points, color , velocity, heat} => {gpu.line(&line_points,color, velocity, heat); gpu.render()}
+                                GPUCommand::Diagnostic => {gpu.print_diagnostics()}
                             }
                         }
                     }
@@ -791,14 +1057,31 @@ impl winit::application::ApplicationHandler for App {
                                         gpu.send(GPUCommand::ToggleLoop).unwrap();
                                     }
                                 }
+                                "e" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::Diagnostic).unwrap();
+                                    }
+                                }
                                 "1" => {
-                                    self.line_color[0] = 1.0 - self.line_color[0];
+                                    println!("Enter Red Density: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    self.line_color[0] = input.parse::<f32>().unwrap();
                                 }
                                 "2" => {
-                                    self.line_color[1] = 1.0 - self.line_color[1];
+                                    println!("Enter Green Density: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    self.line_color[1] = input.parse::<f32>().unwrap();
                                 }
                                 "3" => {
-                                    self.line_color[2] = 1.0 - self.line_color[2];
+                                    println!("Enter Blue Density: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    self.line_color[2] = input.parse::<f32>().unwrap();
                                 }
                                 "4" => {
                                     println!("Enter X Velocity: ");
@@ -878,7 +1161,7 @@ fn main() {
         line_points: Vec::new(), 
         line_color: [1.0,1.0,1.0,1.0], 
         line_velocity: [0.0, 0.0],
-        line_heat: 0.0,
+        line_heat: 0.5,
 
         gpu: None, 
         gpu_size: None
