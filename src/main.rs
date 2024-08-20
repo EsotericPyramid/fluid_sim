@@ -709,6 +709,98 @@ impl<'a> GPU<'a> {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    fn movement(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Compute Encoder"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+                timestamp_writes: None 
+            });       
+            
+            compute_pass.set_pipeline(&self.movement_pipeline);
+            compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
+            compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
+            compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+            compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(
+            &self.secondary_diffuse_storage,
+            0,
+            &self.diffuse_storage,
+            0,
+            self.pad_width as u64 * self.backing_height as u64 * 4 * 4
+        );
+
+        encoder.copy_buffer_to_buffer(
+            &self.secondary_velocity_buffer,
+            0,
+            &self.velocity_buffer,
+            0,
+            self.backing_width as u64 * self.backing_height as u64 * 4 * 2
+        );
+
+        encoder.copy_buffer_to_buffer(
+            &self.secondary_heat_buffer,
+            0,
+            &self.heat_buffer,
+            0,
+            self.backing_width as u64 * self.backing_height as u64 * 4
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn diffusion(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Compute Encoder"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+                timestamp_writes: None 
+            });       
+            
+            compute_pass.set_pipeline(&self.diffusion_pipeline);
+            compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
+            compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
+            compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+            compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(
+            &self.secondary_diffuse_storage,
+            0,
+            &self.diffuse_storage,
+            0,
+            self.pad_width as u64 * self.backing_height as u64 * 4 * 4
+        );
+
+        encoder.copy_buffer_to_buffer(
+            &self.secondary_velocity_buffer,
+            0,
+            &self.velocity_buffer,
+            0,
+            self.backing_width as u64 * self.backing_height as u64 * 4 * 2
+        );
+
+        encoder.copy_buffer_to_buffer(
+            &self.secondary_heat_buffer,
+            0,
+            &self.heat_buffer,
+            0,
+            self.backing_width as u64 * self.backing_height as u64 * 4
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     fn line(&mut self, line_points: &[Point], color: [f32; 4], velocity: [f32; 2], heat: f32) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Line Encoder"),
@@ -831,6 +923,7 @@ impl<'a> GPU<'a> {
             ]
         });
 
+        let mut total_energy = 0.0;
         for i in 0..4 {
             let (active_bind_group, active_buffer, main_buffer ,size, block_size)= match i {
                 0 | 1 => (&velocity_bind_group, &self.secondary_velocity_buffer,&self.velocity_buffer,(self.backing_width, self.backing_height),2),
@@ -904,23 +997,31 @@ impl<'a> GPU<'a> {
                 let view = buffer_clone.slice(0..(block_size * 4)).get_mapped_range();
                 let vec: &[f32] = bytemuck::cast_slice(&view);
                 match i {
-                    0 => println!("Momentum: x: {}, y: {}",vec[0],vec[1]),
-                    1 => println!("KE        x: {}, y: {}",vec[0] / 2.0,vec[1] / 2.0),
-                    2 => println!("Heat:        {}",vec[0]),
-                    3 => println!("Diffuse   R: {}, G: {}, B: {}, A: {}",vec[0],vec[1],vec[2],vec[3]),
+                    0 => println!("\nMomentum: x: {}, y: {}",vec[0],vec[1]),
+                    1 => {
+                        println!("KE        x: {}, y: {}, total: {}",vec[0] / 2.0,vec[1] / 2.0,(vec[0] + vec[1]) / 2.0);
+                        total_energy += (vec[0] + vec[1]) / 2.0;
+                    }
+                    2 => {
+                        println!("Heat:        {}",vec[0]);
+                        total_energy += vec[0]
+                    }
+                    3 => println!("Diffuse   R: {}, G: {}, B: {}, A: {}, Total (excl A): {}",vec[0],vec[1],vec[2],vec[3], vec[0] + vec[1] + vec[2]),
                     _ => panic!("Error: invalid i")
                 }
                 drop(view);
                 buffer_clone.unmap();
             }
         }
-    
+        println!("Total Energy: {}", total_energy);
     }
 }
 
 enum GPUCommand {
     Resize{width: u32, height: u32},
     Compute,
+    Movement,
+    Diffusion,
     ToggleLoop,
     Line{line_points: Vec<Point>, color: [f32; 4], velocity: [f32; 2], heat: f32},
     Diagnostic,
@@ -985,6 +1086,8 @@ impl winit::application::ApplicationHandler for App {
                             match command {
                                 GPUCommand::Resize { width, height } => {gpu.resize(width, height); gpu.render()}
                                 GPUCommand::Compute => {gpu.compute(); gpu.render()}
+                                GPUCommand::Movement => {gpu.movement(); gpu.render()}
+                                GPUCommand::Diffusion => {gpu.diffusion(); gpu.render()}
                                 GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
                                 GPUCommand::Line { line_points, color , velocity, heat} => {gpu.line(&line_points,color, velocity, heat); gpu.render()}
                                 GPUCommand::Diagnostic => {gpu.print_diagnostics()}
@@ -1057,9 +1160,19 @@ impl winit::application::ApplicationHandler for App {
                                         gpu.send(GPUCommand::ToggleLoop).unwrap();
                                     }
                                 }
-                                "e" => {
+                                "d" => {
                                     if let Some(gpu) = &mut self.gpu {
                                         gpu.send(GPUCommand::Diagnostic).unwrap();
+                                    }
+                                }
+                                "e" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::Movement).unwrap();
+                                    }
+                                }
+                                "q" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::Diffusion).unwrap();
                                     }
                                 }
                                 "1" => {
