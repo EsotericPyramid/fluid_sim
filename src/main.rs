@@ -1015,6 +1015,42 @@ impl<'a> GPU<'a> {
         }
         println!("Total Energy: {}", total_energy);
     }
+
+    fn pixel_diagnostics(&self, point: Point) {
+        let staging_buffer = Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor{
+            label: Some("Diagnostic Staging Buffer"),
+            size: 16 + 8 + 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false
+        }));
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Diagnostic Encoder"),
+        });
+
+        encoder.copy_buffer_to_buffer(&self.diffuse_storage, 4 * 4 * (point.0 as u64 + self.pad_width as u64 * point.1 as u64), &staging_buffer, 0, 16);
+        encoder.copy_buffer_to_buffer(&self.velocity_buffer, 2 * 4 * (point.0 as u64 + self.backing_width as u64 * point.1 as u64), &staging_buffer, 16, 8);
+        encoder.copy_buffer_to_buffer(&self.heat_buffer, 4 * (point.0 as u64 + self.backing_width as u64 * point.1 as u64), &staging_buffer, 24, 4);
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let (tx,rx) = mpsc::channel();
+        staging_buffer.slice(0..(16 + 8 + 4)).map_async(wgpu::MapMode::Read, move |res| tx.send(res).unwrap());
+        self.device.poll(wgpu::Maintain::Wait);
+
+        if let Ok(res) = rx.recv() {
+            res.map_err(|err| {println!("{}",err)}).unwrap();
+            let view = staging_buffer.slice(0..(16 + 8 + 4)).get_mapped_range();
+            let data: &[f32] = bytemuck::cast_slice(&view);
+            let total = data[0] + data[1] + data[2];
+            println!("\nDiffuse R: {}, G: {}, B: {}, A: {}, Total (excl A): {}", data[0],data[1],data[2],data[3],total);
+            println!("Velocity X: {}, Y: {}", data[4], data[5]);
+            println!("Momentum X: {}, Y: {}", data[4] * total, data[5] * total);
+            println!("KE X: {}, Y: {}, Total: {}", data[4] * data[4] * total / 2.0, data[5] * data[5] * total / 2.0, (data[4] * data[4] + data[5] * data[5]) * total / 2.0);
+            println!("Heat: {}, HE: {}",data[6], data[6] * total);
+            println!("Total Energy: {}", ((data[4] * data[4] + data[5] * data[5]) / 2.0 + data[6]) * total);
+        }
+    }
 }
 
 enum GPUCommand {
@@ -1025,6 +1061,7 @@ enum GPUCommand {
     ToggleLoop,
     Line{line_points: Vec<Point>, color: [f32; 4], velocity: [f32; 2], heat: f32},
     Diagnostic,
+    PixelDiagnostic{point: Point},
 }
 
 struct GPUSize {
@@ -1040,6 +1077,7 @@ struct App {
     window: Option<Arc<Window>>,
 
     mouse_held: bool,
+    last_mouse_pos: Option<Point>,
     line_points: Vec<Point>,
     line_color: [f32; 4],
     line_velocity: [f32; 2],
@@ -1060,11 +1098,8 @@ impl winit::application::ApplicationHandler for App {
             let mut gpu = pollster::block_on(GPU::new(window.clone(),size.width,size.height));
             self.window = Some(window);
             gpu.line(&[
-                Point(300,200),
-                Point(500,200),
-                Point(500,400),
-                Point(300,400),
-                Point(300,200)
+                Point(400,300),
+                Point(400,301)
             ], self.line_color, self.line_velocity, self.line_heat);
             let (tx,rx) = mpsc::channel();
             std::thread::spawn(move || {
@@ -1091,6 +1126,7 @@ impl winit::application::ApplicationHandler for App {
                                 GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
                                 GPUCommand::Line { line_points, color , velocity, heat} => {gpu.line(&line_points,color, velocity, heat); gpu.render()}
                                 GPUCommand::Diagnostic => {gpu.print_diagnostics()}
+                                GPUCommand::PixelDiagnostic{point} => {gpu.pixel_diagnostics(point)}
                             }
                         }
                     }
@@ -1226,9 +1262,10 @@ impl winit::application::ApplicationHandler for App {
             }
             WindowEvent::CursorMoved {position, ..} => {
                 if let Some(size) = &self.gpu_size {
+                    let x = position.x * size.backing_width as f64 / size.surface_width as f64;
+                    let y = position.y * size.backing_height as f64 / size.surface_height as f64;
+                    self.last_mouse_pos = Some(Point(x as u32, y as u32));
                     if self.mouse_held {
-                        let x = position.x * size.backing_width as f64 / size.surface_width as f64;
-                        let y = position.y * size.backing_height as f64 / size.surface_height as f64;
                         self.line_points.push(Point(x as u32, y as u32));
                     }
                 }
@@ -1247,6 +1284,15 @@ impl winit::application::ApplicationHandler for App {
                                         velocity: self.line_velocity,
                                         heat: self.line_heat
                                     }).unwrap();
+                                }
+                            }
+                        }
+                    }
+                    MouseButton::Right => {
+                        if state == ElementState::Pressed {
+                            if let Some(gpu) = &self.gpu {
+                                if let Some(point) = self.last_mouse_pos {
+                                    gpu.send(GPUCommand::PixelDiagnostic { point }).unwrap();
                                 }
                             }
                         }
@@ -1271,10 +1317,11 @@ fn main() {
         window: None, 
 
         mouse_held: false,
+        last_mouse_pos: None,
         line_points: Vec::new(), 
         line_color: [1.0,1.0,1.0,1.0], 
         line_velocity: [0.0, 0.0],
-        line_heat: 0.5,
+        line_heat: 1.0,
 
         gpu: None, 
         gpu_size: None
