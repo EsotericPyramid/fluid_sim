@@ -17,7 +17,7 @@
 @group(2) @binding(11) var<uniform> line_config: LineConfig;
 
 
-@group(3) @binding(0) var<storage,read_write> wall_buffer: array<u32>;
+@group(3) @binding(0) var<storage,read_write> wall_buffer: array<atomic<u32>>;
 
 struct Size {
     backing_width: u32,
@@ -29,6 +29,7 @@ struct LineConfig {
     color: vec4<f32>,
     velocity: vec2<f32>,
     heat: f32,
+    mode: u32, // 0: gas, 1: wall
 }
 
 struct VertexOutput {
@@ -91,15 +92,15 @@ fn index_2d(point: vec2<u32>) -> u32 {
 
 fn wall_buffer_get_2d(point: vec2<u32>) -> bool {
     let index = index_2d(point);
-    return bool((wall_buffer[index / 8] >> (index % 8)) & 0x00000001);
+    return bool((atomicLoad(&wall_buffer[index / 32]) >> (index % 32)) & 0x00000001);
 }
 
 fn wall_buffer_set_2d(point: vec2<u32>, val: bool) {
     let index = index_2d(point);
-    let arr_index = index / 8;
-    let shifted_val = u32(val) << (index % 8);
-    wall_buffer[arr_index] &= (shifted_val ^ 0x11111111); // set targetted bit to 0
-    wall_buffer[arr_index] |= shifted_val; //set targetted bit to val
+    let arr_index = index / 32;
+    let shifted_val = u32(val) << (index % 32);
+    atomicAnd(&wall_buffer[arr_index], (shifted_val ^ 0xffffffff)); // set targetted bit to 0
+    atomicOr(&wall_buffer[arr_index] , shifted_val); //set targetted bit to val
 }
 
 //make sure to keep in sync with util_shader.wgsl
@@ -122,6 +123,11 @@ fn diffusion_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if global_id.x >= size.backing_width | global_id.y >= size.backing_height {
         return;
     }
+    
+    // dont try to put gas in a wall
+    if wall_buffer_get_2d(vec2(global_id.x,global_id.y)) {
+        return;
+    }
 
     let dimensions = vec2<i32>(i32(size.backing_width),i32(size.backing_height));
     let base_location = vec2<i32>(i32(global_id.x),i32(global_id.y)) + dimensions;
@@ -132,97 +138,116 @@ fn diffusion_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var aggregate_heat = 0.0;
 
     var location = vec2<u32>(0u,0u);
+    var wall_collision = 0u;
     var heat = 0.0;
     var new_diffuse = vec4(0.0,0.0,0.0,0.0);
     var diffuse_total = 0.0;
     var velocity = vec2(0.0,0.0);
 
     location = vec2<u32>((base_location + vec2(-1,-1)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     aggregate_velocity += (velocity + vec2(inverseSqrt(2.0),inverseSqrt(2.0)) * sqrt(heat)) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,0)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)]; // can be simplified
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision))); // can be simplified
     aggregate_velocity += (velocity + ((vec2(1.0,0.0) * heat) + (vec2(inverseSqrt(2.0),0.0) * sqrt(heat)) * (sqrt(2.0 * heat) - heat))) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,1)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     aggregate_velocity += (velocity + vec2(inverseSqrt(2.0),-inverseSqrt(2.0)) * sqrt(heat)) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,-1)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)]; // can be simplified
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision))); // can be simplified
     aggregate_velocity += (velocity + ((vec2(0.0,1.0) * heat) + (vec2(0.0,inverseSqrt(2.0)) * sqrt(heat)) * (sqrt(2.0 * heat) - heat))) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,0)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((4.0 - sqrt(heat) * (2.0 + 2.0 * sqrt(2.0)) + heat) / 4.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     aggregate_velocity += velocity * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,1)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)]; // can be simplified
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision))); // can be simplified
     aggregate_velocity += (velocity + ((vec2(0.0,-1.0) * heat) + (vec2(0.0,-inverseSqrt(2.0)) * sqrt(heat)) * (sqrt(2.0 * heat) - heat))) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,-1)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     aggregate_velocity += (velocity + vec2(-inverseSqrt(2.0),inverseSqrt(2.0)) * sqrt(heat)) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,0)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((sqrt(heat) * (1.0 + sqrt(2.0)) - heat) / 8.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)]; // can be simplified
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision))); // can be simplified
     aggregate_velocity += (velocity + ((vec2(-1.0,0.0) * heat) + (vec2(-inverseSqrt(2.0),0.0) * sqrt(heat)) * (sqrt(2.0 * heat) - heat))) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,1)) % dimensions);
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
     heat = heat_buffer[index_2d(location)];
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (heat / 16.0);
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
-    velocity = velocity_buffer[index_2d(location)];
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     aggregate_velocity += (velocity + vec2(-inverseSqrt(2.0),-inverseSqrt(2.0)) * sqrt(heat)) * diffuse_total;
     expected_velocity_energy += velocity * velocity * diffuse_total;
     aggregate_heat += heat * diffuse_total;
@@ -250,6 +275,11 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
+    // dont try to put gas in a wall
+    if wall_buffer_get_2d(vec2(global_id.x,global_id.y)) {
+        return;
+    }
+
     let dimensions = vec2<i32>(i32(size.backing_width),i32(size.backing_height));
     let base_location = vec2<i32>(i32(global_id.x),i32(global_id.y)) + dimensions;
 
@@ -259,7 +289,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var aggregate_heat = 0.0;
 
     var location = vec2<u32>((base_location + vec2(-1,-1)) % dimensions);
-    var velocity = velocity_buffer[index_2d(location)];
+    var wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    var velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     var new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(velocity.x,0.0) * max(velocity.y,0.0));
     var diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -268,7 +300,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,0)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(velocity.x,0.0) * (1.0 - abs(velocity.y)));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -277,7 +311,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(-1,1)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(velocity.x,0.0) * max(-velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -286,7 +322,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,-1)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((1.0 - abs(velocity.x)) * max(velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -295,7 +333,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,0)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((1.0 - abs(velocity.x)) * (1.0 - abs(velocity.y)));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -304,7 +344,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(0,1)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * ((1.0 - abs(velocity.x)) * max(-velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -313,7 +355,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,-1)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(-velocity.x,0.0) * max(velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -322,7 +366,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,0)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(-velocity.x,0.0) * (1.0 - abs(velocity.y)));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -331,7 +377,9 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     aggregate_heat += heat_buffer[index_2d(location)] * diffuse_total;
 
     location = vec2<u32>((base_location + vec2(1,1)) % dimensions);
-    velocity = velocity_buffer[index_2d(location)];
+    wall_collision = u32(wall_buffer_get_2d(location));
+    location = wall_collision * vec2<u32>(base_location % dimensions) + (1 - wall_collision) * location;
+    velocity = velocity_buffer[index_2d(location)] * f32(sign(1 - 2 * i32(wall_collision)));
     new_diffuse = diffuse_storage[pad_index_2d(location)] * (max(-velocity.x,0.0) * max(-velocity.y,0.0));
     diffuse_total = total_diffuse(new_diffuse);
     aggregate_diffuse += new_diffuse;
@@ -368,16 +416,20 @@ fn line_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var current_point = vec2<f32>(start_point);
     for (var i = 0; i < num_iterations; i++) {
         let rounded_current_point = vec2<u32>(round(current_point));
-        diffuse_storage[rounded_current_point.x + size.pad_width * rounded_current_point.y] = line_config.color;
+        diffuse_storage[pad_index_2d(rounded_current_point)] = line_config.color;
+        diffuse_storage[pad_index_2d(rounded_current_point + vec2(1,0))] = line_config.color;
+        diffuse_storage[pad_index_2d(rounded_current_point - vec2(1,0))] = line_config.color;
+        diffuse_storage[pad_index_2d(rounded_current_point + vec2(0,1))] = line_config.color;
+        diffuse_storage[pad_index_2d(rounded_current_point - vec2(0,1))] = line_config.color;
         velocity_buffer[index_2d(rounded_current_point)] = line_config.velocity;
         heat_buffer[index_2d(rounded_current_point)] = line_config.heat;
-        //diffuse_storage[(rounded_current_point.x + 1) + size.pad_width * rounded_current_point.y] = pack4xU8(vec4(255u,255u,255u,255u));
-        //diffuse_storage[(rounded_current_point.x - 1) + size.pad_width * rounded_current_point.y] = pack4xU8(vec4(255u,255u,255u,255u));
-        //diffuse_storage[rounded_current_point.x + size.pad_width * (rounded_current_point.y + 1)] = pack4xU8(vec4(255u,255u,255u,255u));
-        //diffuse_storage[rounded_current_point.x + size.pad_width * (rounded_current_point.y - 1)] = pack4xU8(vec4(255u,255u,255u,255u));
+        wall_buffer_set_2d(rounded_current_point,line_config.mode == 1);
+        wall_buffer_set_2d(rounded_current_point + vec2(1,0),line_config.mode == 1);
+        wall_buffer_set_2d(rounded_current_point - vec2(1,0),line_config.mode == 1);
+        wall_buffer_set_2d(rounded_current_point + vec2(0,1),line_config.mode == 1);
+        wall_buffer_set_2d(rounded_current_point - vec2(0,1),line_config.mode == 1);
         current_point += delta_point;
     }
-    
 }
 
  

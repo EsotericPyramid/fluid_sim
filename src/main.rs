@@ -12,13 +12,22 @@ use winit::window::*;
 use winit::event::*;
 use winit::event_loop::{ActiveEventLoop,EventLoop};
 
-fn pad(x: u32, pad: u32) -> u32 {
+fn pad_u32(x: u32, pad: u32) -> u32 {
     if x > 0 {
         return (((x -1) / pad) + 1) * pad;
     } else {
         return 0;
     }
 }
+
+fn pad_u64(x: u64, pad: u64) -> u64 {
+    if x > 0 {
+        return (((x -1) / pad) + 1) * pad;
+    } else {
+        return 0;
+    }
+}
+
 
 fn round_up_div_u64(dividend: u64, divisor: u64) -> u64 {
     ((dividend -1) / divisor) + 1
@@ -31,6 +40,36 @@ fn round_up_div_u32(dividend: u32, divisor: u32) -> u32 {
 #[repr(C)]
 #[derive(Clone,Copy,bytemuck::Zeroable,bytemuck::Pod)]
 struct Point(u32,u32);
+
+#[derive(Clone)]
+enum LineConfig{
+    Gas{
+        color: [f32; 4],
+        velocity: [f32; 2],
+        heat: f32
+    },
+    Wall
+}
+
+impl LineConfig {
+    fn as_byte_array(self) -> [u8; 32] {
+        bytemuck::cast(match self {
+            Self::Gas { color, velocity, heat } => {
+                let mut line_config = [0.0; 8];
+                line_config[0..4].copy_from_slice(&color);
+                line_config[4..6].copy_from_slice(&velocity);
+                line_config[6] = heat;
+                line_config[7] = bytemuck::cast(0u32); 
+                line_config
+            }
+            Self::Wall => {
+                let mut line_config = [0.0; 8];
+                line_config[7] = bytemuck::cast(1u32);
+                line_config
+            }
+        })
+    }
+}
 
 #[allow(dead_code)]
 struct GPU<'a> {
@@ -76,8 +115,8 @@ struct GPU<'a> {
 
 impl<'a> GPU<'a> {
     async fn new(window: Arc<Window>,backing_width: u32, backing_height: u32) -> Self {
-        let pad_width = pad(backing_width,16);
-        let pad_height = pad(backing_height,8);
+        let pad_width = pad_u32(backing_width,16);
+        let pad_height = pad_u32(backing_height,8);
 
         let instance = wgpu::Instance::default();
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptionsBase::default()).await.unwrap();
@@ -340,7 +379,7 @@ impl<'a> GPU<'a> {
 
         let line_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Line Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&line_group_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&line_group_layout,&wall_buffer_layout],
             push_constant_ranges: &[]
         });
 
@@ -448,7 +487,7 @@ impl<'a> GPU<'a> {
 
         let wall_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Wall Buffer"),
-            size: round_up_div_u64(backing_width as u64 * backing_height as u64, 32), //stored as a bit array which is truly [u32]
+            size: pad_u64((backing_width as u64 * backing_height as u64) / 8,4), //stored as a bit array which is truly [u32]
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
@@ -696,13 +735,13 @@ impl<'a> GPU<'a> {
                 compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
-                compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+                compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
                 compute_pass.set_pipeline(&self.diffusion_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.secondary_gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
-                compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+                compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
             }
         }
 
@@ -725,7 +764,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
             compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
-            compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+            compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
         }
 
         encoder.copy_buffer_to_buffer(
@@ -771,7 +810,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
             compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
-            compute_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+            compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
         }
 
         encoder.copy_buffer_to_buffer(
@@ -801,7 +840,7 @@ impl<'a> GPU<'a> {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
-    fn line(&mut self, line_points: &[Point], color: [f32; 4], velocity: [f32; 2], heat: f32) {
+    fn line(&mut self, line_points: &[Point], line_config: LineConfig) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Line Encoder"),
         }); 
@@ -818,14 +857,9 @@ impl<'a> GPU<'a> {
                 usage: wgpu::BufferUsages::STORAGE
             });
 
-            let mut line_config = [0.0; 8];
-            line_config[0..4].copy_from_slice(&color);
-            line_config[4..6].copy_from_slice(&velocity);
-            line_config[6] = heat;
-
             let line_config_buffer = self.device.create_buffer_init(&BufferInitDescriptor{
                 label: Some("Line Color Buffer"),
-                contents: bytemuck::cast_slice(&line_config),
+                contents: &line_config.as_byte_array(),
                 usage: wgpu::BufferUsages::UNIFORM
             });
 
@@ -848,7 +882,8 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &line_bind_group, &[]);
-            compute_pass.dispatch_workgroups(pad(line_points.len() as u32 -1,64), 1, 1);
+            compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+            compute_pass.dispatch_workgroups(pad_u32(line_points.len() as u32 -1,64), 1, 1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -973,7 +1008,7 @@ impl<'a> GPU<'a> {
                 diagnostic_pass.set_bind_group(0, active_bind_group, &[]);
                 diagnostic_pass.set_bind_group(1, &diffuse_bind_group, &[]);
                 diagnostic_pass.set_bind_group(2, &self.size_bind_group, &[]);
-                diagnostic_pass.dispatch_workgroups(pad(self.backing_width,8)/8, self.pad_height/8, 1);
+                diagnostic_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
             }
             self.sum_buffer(diagnostic_pass, active_bind_group, block_size as u32);
     
@@ -1059,7 +1094,7 @@ enum GPUCommand {
     Movement,
     Diffusion,
     ToggleLoop,
-    Line{line_points: Vec<Point>, color: [f32; 4], velocity: [f32; 2], heat: f32},
+    Line{line_points: Vec<Point>, line_config: LineConfig},
     Diagnostic,
     PixelDiagnostic{point: Point},
 }
@@ -1079,9 +1114,7 @@ struct App {
     mouse_held: bool,
     last_mouse_pos: Option<Point>,
     line_points: Vec<Point>,
-    line_color: [f32; 4],
-    line_velocity: [f32; 2],
-    line_heat: f32,
+    line_config: LineConfig,
 
     gpu: Option<mpsc::Sender<GPUCommand>>,
     gpu_size: Option<GPUSize>
@@ -1097,10 +1130,6 @@ impl winit::application::ApplicationHandler for App {
             let size = window.inner_size();
             let mut gpu = pollster::block_on(GPU::new(window.clone(),size.width,size.height));
             self.window = Some(window);
-            gpu.line(&[
-                Point(400,300),
-                Point(400,301)
-            ], self.line_color, self.line_velocity, self.line_heat);
             let (tx,rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let mut compute_loop = false;
@@ -1124,7 +1153,7 @@ impl winit::application::ApplicationHandler for App {
                                 GPUCommand::Movement => {gpu.movement(); gpu.render()}
                                 GPUCommand::Diffusion => {gpu.diffusion(); gpu.render()}
                                 GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
-                                GPUCommand::Line { line_points, color , velocity, heat} => {gpu.line(&line_points,color, velocity, heat); gpu.render()}
+                                GPUCommand::Line { line_points, line_config} => {gpu.line(&line_points,line_config); gpu.render()}
                                 GPUCommand::Diagnostic => {gpu.print_diagnostics()}
                                 GPUCommand::PixelDiagnostic{point} => {gpu.pixel_diagnostics(point)}
                             }
@@ -1216,42 +1245,77 @@ impl winit::application::ApplicationHandler for App {
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    self.line_color[0] = input.parse::<f32>().unwrap();
+                                    if let LineConfig::Gas{color, ..} = &mut self.line_config {
+                                        color[0] = input.parse::<f32>().unwrap();
+                                    }
                                 }
                                 "2" => {
                                     println!("Enter Green Density: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    self.line_color[1] = input.parse::<f32>().unwrap();
+                                    if let LineConfig::Gas{color, ..} = &mut self.line_config {
+                                        color[1] = input.parse::<f32>().unwrap();
+                                    }
                                 }
                                 "3" => {
                                     println!("Enter Blue Density: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    self.line_color[2] = input.parse::<f32>().unwrap();
+                                    if let LineConfig::Gas{color, ..} = &mut self.line_config {
+                                        color[2] = input.parse::<f32>().unwrap();
+                                    }
                                 }
                                 "4" => {
                                     println!("Enter X Velocity: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    self.line_velocity[0] = input.parse::<f32>().unwrap();
+                                    if let LineConfig::Gas{velocity, ..} = &mut self.line_config {
+                                        velocity[0] = input.parse::<f32>().unwrap();
+                                    }
                                 }
                                 "5" => {
                                     println!("Enter Y Velocity: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    self.line_velocity[1] = input.parse::<f32>().unwrap();
+                                    if let LineConfig::Gas{velocity, ..} = &mut self.line_config {
+                                        velocity[1] = input.parse::<f32>().unwrap();
+                                    }
                                 }
                                 "6" => {
                                     println!("Enter Heat: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    self.line_heat = input.parse::<f32>().unwrap();
+                                    if let LineConfig::Gas{heat, ..} = &mut self.line_config {
+                                        *heat = input.parse::<f32>().unwrap();
+                                    }
+                                }
+                                "7" => {
+                                    println!("Enter Mode: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    let mode = input.parse::<u32>().unwrap();
+                                    match mode {
+                                        0 => {
+                                            match &self.line_config {
+                                                LineConfig::Gas{..} => {}
+                                                LineConfig::Wall => {self.line_config = LineConfig::Gas { 
+                                                    color: [1.0,1.0,1.0,1.0], 
+                                                    velocity: [0.0, 0.0],
+                                                    heat: 0.0
+                                                }}
+                                            }
+                                        },
+                                        1 => {
+                                            self.line_config = LineConfig::Wall;
+                                        },
+                                        _ => println!("Invalid Mode")
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1280,9 +1344,7 @@ impl winit::application::ApplicationHandler for App {
                                 if let Some(gpu) = &self.gpu {
                                     gpu.send(GPUCommand::Line{
                                         line_points: std::mem::replace(&mut self.line_points, Vec::new()), 
-                                        color: self.line_color, 
-                                        velocity: self.line_velocity,
-                                        heat: self.line_heat
+                                        line_config: self.line_config.clone()
                                     }).unwrap();
                                 }
                             }
@@ -1319,9 +1381,11 @@ fn main() {
         mouse_held: false,
         last_mouse_pos: None,
         line_points: Vec::new(), 
-        line_color: [1.0,1.0,1.0,1.0], 
-        line_velocity: [0.0, 0.0],
-        line_heat: 1.0,
+        line_config: LineConfig::Gas {
+            color: [1.0,1.0,1.0,1.0], 
+            velocity: [0.0, 0.0],
+            heat: 0.0
+        },
 
         gpu: None, 
         gpu_size: None
