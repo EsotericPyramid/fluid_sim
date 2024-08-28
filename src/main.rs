@@ -42,31 +42,44 @@ fn round_up_div_u32(dividend: u32, divisor: u32) -> u32 {
 struct Point(u32,u32);
 
 #[derive(Clone)]
-enum LineConfig{
-    Gas{
-        color: [f32; 4],
-        velocity: [f32; 2],
-        heat: f32
-    },
-    Wall
+struct LineConfig{
+    color: [f32; 4],
+    velocity: [f32; 2],
+    heat: f32,
+    color_mode: ColorMode,
+    static_velocity: bool,
+    static_heat: bool,
+    is_wall: bool,
+}
+
+#[derive(Clone)]
+enum ColorMode{
+    Default,
+    Static,
+    Paint
 }
 
 impl LineConfig {
     fn as_byte_array(self) -> [u8; 32] {
-        bytemuck::cast(match self {
-            Self::Gas { color, velocity, heat } => {
-                let mut line_config = [0.0; 8];
-                line_config[0..4].copy_from_slice(&color);
-                line_config[4..6].copy_from_slice(&velocity);
-                line_config[6] = heat;
-                line_config[7] = bytemuck::cast(0u32); 
-                line_config
+        bytemuck::cast({
+            let mut line_config = [0.0; 8];
+            line_config[0..4].copy_from_slice(&self.color);
+            line_config[4..6].copy_from_slice(&self.velocity);
+            line_config[6] = self.heat;
+            if self.is_wall {
+                line_config[7] = bytemuck::cast(0b1111); 
+            } else {
+                let mut mode: u32= match self.color_mode {
+                    ColorMode::Default => 0,
+                    ColorMode::Static => 1,
+                    ColorMode::Paint => 2,
+                };
+                mode |= (self.static_velocity as u32) << 2;
+                mode |= (self.static_heat as u32) << 3;
+                println!("{}",mode);
+                line_config[7] = bytemuck::cast(mode);
             }
-            Self::Wall => {
-                let mut line_config = [0.0; 8];
-                line_config[7] = bytemuck::cast(1u32);
-                line_config
-            }
+            line_config
         })
     }
 }
@@ -109,7 +122,7 @@ struct GPU<'a> {
     size_bind_group: wgpu::BindGroup,
     gas_data_bind_group: wgpu::BindGroup,
     secondary_gas_data_bind_group: wgpu::BindGroup,
-    wall_buffer_bind_group: wgpu::BindGroup,
+    mode_bind_group: wgpu::BindGroup,
     fragment_bind_group: wgpu::BindGroup
 }
 
@@ -204,7 +217,7 @@ impl<'a> GPU<'a> {
             ]
         });
 
-        let wall_buffer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+        let mode_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
             label: Some("Wall Buffer Layout"), 
             entries: &[
                 wgpu::BindGroupLayoutEntry{
@@ -349,7 +362,7 @@ impl<'a> GPU<'a> {
 
         let diffusion_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Diffusion Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&wall_buffer_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&mode_layout],
             push_constant_ranges: &[]
         });
 
@@ -364,7 +377,7 @@ impl<'a> GPU<'a> {
 
         let movement_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Movement Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&wall_buffer_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&mode_layout],
             push_constant_ranges: &[]
         });
 
@@ -379,7 +392,7 @@ impl<'a> GPU<'a> {
 
         let line_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Line Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&line_group_layout,&wall_buffer_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&line_group_layout,&mode_layout],
             push_constant_ranges: &[]
         });
 
@@ -485,9 +498,9 @@ impl<'a> GPU<'a> {
             mapped_at_creation: false
         });
 
-        let wall_buffer = device.create_buffer(&wgpu::BufferDescriptor{
+        let mode_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Wall Buffer"),
-            size: pad_u64((backing_width as u64 * backing_height as u64) / 8,4), //stored as a bit array which is truly [u32]
+            size: pad_u64((backing_width as u64 * backing_height as u64) / 2,4), //stored as a bit array which is truly [u32]
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
@@ -563,13 +576,13 @@ impl<'a> GPU<'a> {
             ] 
         });
 
-        let wall_buffer_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let mode_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Wall Bind Group"),
-            layout: &wall_buffer_layout,
+            layout: &mode_layout,
             entries: &[
                 wgpu::BindGroupEntry{
                     binding: 0,
-                    resource: wall_buffer.as_entire_binding()
+                    resource: mode_buffer.as_entire_binding()
                 }
             ]
         });
@@ -637,7 +650,7 @@ impl<'a> GPU<'a> {
             size_bind_group,
             gas_data_bind_group,
             secondary_gas_data_bind_group,
-            wall_buffer_bind_group,
+            mode_bind_group,
             fragment_bind_group
         }
     }
@@ -734,13 +747,13 @@ impl<'a> GPU<'a> {
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
-                compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+                compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
                 compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
                 compute_pass.set_pipeline(&self.diffusion_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.secondary_gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.gas_data_bind_group, &[]);
-                compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+                compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
                 compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
             }
         }
@@ -763,7 +776,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
-            compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+            compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
             compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
         }
 
@@ -809,7 +822,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
-            compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+            compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
             compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
         }
 
@@ -882,7 +895,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &line_bind_group, &[]);
-            compute_pass.set_bind_group(3, &self.wall_buffer_bind_group, &[]);
+            compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
             compute_pass.dispatch_workgroups(pad_u32(line_points.len() as u32 -1,64), 1, 1);
         }
 
@@ -1245,76 +1258,65 @@ impl winit::application::ApplicationHandler for App {
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    if let LineConfig::Gas{color, ..} = &mut self.line_config {
-                                        color[0] = input.parse::<f32>().unwrap();
-                                    }
+                                    self.line_config.color[0] = input.parse::<f32>().unwrap();
                                 }
                                 "2" => {
                                     println!("Enter Green Density: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    if let LineConfig::Gas{color, ..} = &mut self.line_config {
-                                        color[1] = input.parse::<f32>().unwrap();
-                                    }
+                                    self.line_config.color[1] = input.parse::<f32>().unwrap();
                                 }
                                 "3" => {
                                     println!("Enter Blue Density: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    if let LineConfig::Gas{color, ..} = &mut self.line_config {
-                                        color[2] = input.parse::<f32>().unwrap();
-                                    }
+                                    self.line_config.color[2] = input.parse::<f32>().unwrap();
                                 }
                                 "4" => {
                                     println!("Enter X Velocity: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    if let LineConfig::Gas{velocity, ..} = &mut self.line_config {
-                                        velocity[0] = input.parse::<f32>().unwrap();
-                                    }
+                                    self.line_config.velocity[0] = input.parse::<f32>().unwrap();
                                 }
                                 "5" => {
                                     println!("Enter Y Velocity: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    if let LineConfig::Gas{velocity, ..} = &mut self.line_config {
-                                        velocity[1] = input.parse::<f32>().unwrap();
-                                    }
+                                    self.line_config.velocity[1] = input.parse::<f32>().unwrap();
                                 }
                                 "6" => {
                                     println!("Enter Heat: ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    if let LineConfig::Gas{heat, ..} = &mut self.line_config {
-                                        *heat = input.parse::<f32>().unwrap();
-                                    }
+                                    self.line_config.heat = input.parse::<f32>().unwrap();
                                 }
                                 "7" => {
-                                    println!("Enter Mode: ");
+                                    println!("Enter Mode Target (0: color, 1: velocity, 2: heat, 3: wall): ");
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
+                                    let mode_target = input.parse::<u32>().unwrap();
+                                    println!("Enter Mode: ");
+                                    input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
                                     let mode = input.parse::<u32>().unwrap();
-                                    match mode {
-                                        0 => {
-                                            match &self.line_config {
-                                                LineConfig::Gas{..} => {}
-                                                LineConfig::Wall => {self.line_config = LineConfig::Gas { 
-                                                    color: [1.0,1.0,1.0,1.0], 
-                                                    velocity: [0.0, 0.0],
-                                                    heat: 0.0
-                                                }}
-                                            }
-                                        },
-                                        1 => {
-                                            self.line_config = LineConfig::Wall;
-                                        },
-                                        _ => println!("Invalid Mode")
+                                    match (mode_target, mode) {
+                                        (0,0) => {self.line_config.color_mode = ColorMode::Default},
+                                        (0,1) => {self.line_config.color_mode = ColorMode::Static},
+                                        (0,2) => {self.line_config.color_mode = ColorMode::Paint},
+                                        (1,0) => {self.line_config.static_velocity = false},
+                                        (1,1) => {self.line_config.static_velocity = true},
+                                        (2,0) => {self.line_config.static_heat = false},
+                                        (2,1) => {self.line_config.static_heat = true},
+                                        (3,0) => {self.line_config.is_wall = false},
+                                        (3,1) => {self.line_config.is_wall = true},
+                                        (_,_) => println!("Unregonized mode target / mode")
                                     }
                                 }
                                 _ => {}
@@ -1381,10 +1383,14 @@ fn main() {
         mouse_held: false,
         last_mouse_pos: None,
         line_points: Vec::new(), 
-        line_config: LineConfig::Gas {
+        line_config: LineConfig {
             color: [1.0,1.0,1.0,1.0], 
             velocity: [0.0, 0.0],
-            heat: 0.0
+            heat: 0.0,
+            color_mode: ColorMode::Default,
+            static_velocity: false,
+            static_heat: false,
+            is_wall: false
         },
 
         gpu: None, 
