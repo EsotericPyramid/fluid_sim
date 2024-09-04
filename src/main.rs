@@ -28,11 +28,6 @@ fn pad_u64(x: u64, pad: u64) -> u64 {
     }
 }
 
-
-fn round_up_div_u64(dividend: u64, divisor: u64) -> u64 {
-    ((dividend -1) / divisor) + 1
-}
-
 fn round_up_div_u32(dividend: u32, divisor: u32) -> u32 {
     ((dividend -1) / divisor) + 1
 }
@@ -76,7 +71,6 @@ impl LineConfig {
                 };
                 mode |= (self.static_velocity as u32) << 2;
                 mode |= (self.static_heat as u32) << 3;
-                println!("{}",mode);
                 line_config[7] = bytemuck::cast(mode);
             }
             line_config
@@ -731,7 +725,7 @@ impl<'a> GPU<'a> {
         output.present();
     }
 
-    fn compute(&mut self) {
+    fn compute(&mut self,num_ticks: u32) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Compute Encoder"),
         });
@@ -742,7 +736,7 @@ impl<'a> GPU<'a> {
                 timestamp_writes: None 
             });       
             
-            for _ in 0..60 {
+            for _ in 0..num_ticks {
                 compute_pass.set_pipeline(&self.movement_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
@@ -1103,10 +1097,11 @@ impl<'a> GPU<'a> {
 
 enum GPUCommand {
     Resize{width: u32, height: u32},
-    Compute,
+    Compute{num_ticks: u32},
     Movement,
     Diffusion,
     ToggleLoop,
+    SetTickRate{num_ticks: u32},
     Line{line_points: Vec<Point>, line_config: LineConfig},
     Diagnostic,
     PixelDiagnostic{point: Point},
@@ -1146,6 +1141,7 @@ impl winit::application::ApplicationHandler for App {
             let (tx,rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let mut compute_loop = false;
+                let mut num_ticks_per_frame = 60;
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_millis(20)) {
                         Err(e) => {
@@ -1153,7 +1149,7 @@ impl winit::application::ApplicationHandler for App {
                                 mpsc::RecvTimeoutError::Disconnected => {break;}
                                 mpsc::RecvTimeoutError::Timeout => {
                                     if compute_loop {
-                                        gpu.compute();
+                                        gpu.compute(num_ticks_per_frame);
                                         gpu.render();
                                     }
                                 }
@@ -1162,10 +1158,11 @@ impl winit::application::ApplicationHandler for App {
                         Ok(command) => {
                             match command {
                                 GPUCommand::Resize { width, height } => {gpu.resize(width, height); gpu.render()}
-                                GPUCommand::Compute => {gpu.compute(); gpu.render()}
+                                GPUCommand::Compute { num_ticks} => {gpu.compute(num_ticks); gpu.render()}
                                 GPUCommand::Movement => {gpu.movement(); gpu.render()}
                                 GPUCommand::Diffusion => {gpu.diffusion(); gpu.render()}
                                 GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
+                                GPUCommand::SetTickRate { num_ticks } => {num_ticks_per_frame = num_ticks}
                                 GPUCommand::Line { line_points, line_config} => {gpu.line(&line_points,line_config); gpu.render()}
                                 GPUCommand::Diagnostic => {gpu.print_diagnostics()}
                                 GPUCommand::PixelDiagnostic{point} => {gpu.pixel_diagnostics(point)}
@@ -1230,7 +1227,7 @@ impl winit::application::ApplicationHandler for App {
                             match key.as_str() {
                                 "r" => {
                                     if let Some(gpu) = &mut self.gpu {
-                                        gpu.send(GPUCommand::Compute).unwrap();
+                                        gpu.send(GPUCommand::Compute{num_ticks: 60}).unwrap();
                                     }
                                 }
                                 "f" => {
@@ -1251,6 +1248,15 @@ impl winit::application::ApplicationHandler for App {
                                 "q" => {
                                     if let Some(gpu) = &mut self.gpu {
                                         gpu.send(GPUCommand::Diffusion).unwrap();
+                                    }
+                                }
+                                "v" => {
+                                    println!("Enter Tick Rate: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::SetTickRate { num_ticks: input.parse::<u32>().unwrap()}).unwrap();
                                     }
                                 }
                                 "1" => {
