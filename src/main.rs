@@ -96,28 +96,31 @@ struct GPU<'a> {
     diffusion_pipeline: wgpu::ComputePipeline,
     movement_pipeline: wgpu::ComputePipeline,
     line_pipeline: wgpu::ComputePipeline,
+    load_texture_pipeline: wgpu::ComputePipeline,
     // diagnostic util pipelines
     half_sum_pipeline: wgpu::ComputePipeline,
     square_pipeline: wgpu::ComputePipeline,
     diffusion_scale_pipeline: wgpu::ComputePipeline,
 
     line_group_layout: wgpu::BindGroupLayout,
+    load_texture_layout: wgpu::BindGroupLayout,
     util_buffer_group_layout: wgpu::BindGroupLayout,
     half_sum_group_layout: wgpu::BindGroupLayout,
 
-    diffuse_storage: wgpu::Buffer,
+    diffuse_buffer: wgpu::Buffer,
     velocity_buffer: wgpu::Buffer,
     heat_buffer: wgpu::Buffer,
-    secondary_diffuse_storage: wgpu::Buffer,
+    secondary_diffuse_buffer: wgpu::Buffer,
     secondary_velocity_buffer: wgpu::Buffer,
     secondary_heat_buffer: wgpu::Buffer,
     diffuse: wgpu::Texture,
+    diffuse_view: wgpu::TextureView,
 
     size_bind_group: wgpu::BindGroup,
     gas_data_bind_group: wgpu::BindGroup,
     secondary_gas_data_bind_group: wgpu::BindGroup,
     mode_bind_group: wgpu::BindGroup,
-    fragment_bind_group: wgpu::BindGroup
+    fragment_bind_group: wgpu::BindGroup,
 }
 
 impl<'a> GPU<'a> {
@@ -175,7 +178,7 @@ impl<'a> GPU<'a> {
             ]
         });
 
-        let diffuse_storage_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+        let diffuse_buffer_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
             label: Some("Compute Group Layout"), 
             entries: &[
                 wgpu::BindGroupLayoutEntry{
@@ -275,6 +278,32 @@ impl<'a> GPU<'a> {
             ]
         });
 
+        let load_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Load To Texture layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture { 
+                        access: wgpu::StorageTextureAccess::WriteOnly, 
+                        format: wgpu::TextureFormat::Rgba32Float, 
+                        view_dimension: wgpu::TextureViewDimension::D2 
+                    },
+                    count: None
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 21,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: None 
+                    },
+                    count: None
+                }
+            ]
+        });
+
         let util_buffer_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Util Buffer Group Layout"),
             entries: &[
@@ -356,7 +385,7 @@ impl<'a> GPU<'a> {
 
         let diffusion_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Diffusion Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&mode_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_buffer_group_layout,&diffuse_buffer_group_layout,&mode_layout],
             push_constant_ranges: &[]
         });
 
@@ -371,7 +400,7 @@ impl<'a> GPU<'a> {
 
         let movement_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Movement Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&diffuse_storage_group_layout,&mode_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_buffer_group_layout,&diffuse_buffer_group_layout,&mode_layout],
             push_constant_ranges: &[]
         });
 
@@ -386,7 +415,7 @@ impl<'a> GPU<'a> {
 
         let line_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor{
             label: Some("Line Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_storage_group_layout,&line_group_layout,&mode_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_buffer_group_layout,&line_group_layout,&mode_layout],
             push_constant_ranges: &[]
         });
 
@@ -397,6 +426,21 @@ impl<'a> GPU<'a> {
             entry_point: "line_main",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None
+        });
+
+        let load_texture_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
+            label: Some("Load To Texture Pipeline Layout"),
+            bind_group_layouts: &[&size_group_layout,&diffuse_buffer_group_layout,&load_texture_layout],
+            push_constant_ranges: &[]
+        });
+
+        let load_texture_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+           label: Some("Load To Texture Pipeline"),
+           layout: Some(&load_texture_pipeline_layout),
+           module: &sim_shader,
+           entry_point: "load_to_texture",
+           compilation_options: wgpu::PipelineCompilationOptions::default(),
+           cache: None
         });
 
         let half_sum_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
@@ -450,7 +494,7 @@ impl<'a> GPU<'a> {
             usage: wgpu::BufferUsages::UNIFORM
         });
 
-        let diffuse_storage = device.create_buffer(&wgpu::BufferDescriptor{
+        let diffuse_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Diffuse Buffer"),
             size: pad_width  as u64 * backing_height as u64 * 4 * 4,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
@@ -471,7 +515,7 @@ impl<'a> GPU<'a> {
             mapped_at_creation: false
         });
 
-        let secondary_diffuse_storage = device.create_buffer(&wgpu::BufferDescriptor{
+        let secondary_diffuse_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Secondary Diffuse Buffer"),
             size: pad_width  as u64 * backing_height as u64 * 4 * 4,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
@@ -506,7 +550,7 @@ impl<'a> GPU<'a> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[wgpu::TextureFormat::Rgba32Float]
         });
 
@@ -534,11 +578,11 @@ impl<'a> GPU<'a> {
 
         let gas_data_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
             label: Some("Compute Bind Group"), 
-            layout: &diffuse_storage_group_layout, 
+            layout: &diffuse_buffer_group_layout, 
             entries: &[
                 wgpu::BindGroupEntry{
                     binding: 0,
-                    resource: diffuse_storage.as_entire_binding()
+                    resource: diffuse_buffer.as_entire_binding()
                 },
                 wgpu::BindGroupEntry{
                     binding: 1,
@@ -553,11 +597,11 @@ impl<'a> GPU<'a> {
 
         let secondary_gas_data_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { 
             label: Some("Secondary Diffuse Bind Group"), 
-            layout: &diffuse_storage_group_layout, 
+            layout: &diffuse_buffer_group_layout, 
             entries: &[
                 wgpu::BindGroupEntry{
                     binding: 0,
-                    resource: secondary_diffuse_storage.as_entire_binding()
+                    resource: secondary_diffuse_buffer.as_entire_binding()
                 },
                 wgpu::BindGroupEntry{
                     binding: 1,
@@ -581,7 +625,7 @@ impl<'a> GPU<'a> {
             ]
         });
 
-        let texture_view = diffuse.create_view(&wgpu::TextureViewDescriptor{ 
+        let diffuse_view = diffuse.create_view(&wgpu::TextureViewDescriptor{ 
             label: Some("Texture View"), 
             format: Some(wgpu::TextureFormat::Rgba32Float), 
             dimension: Some(wgpu::TextureViewDimension::D2), 
@@ -598,7 +642,7 @@ impl<'a> GPU<'a> {
             entries: &[
                 wgpu::BindGroupEntry{
                     binding: 10,
-                    resource: wgpu::BindingResource::TextureView(&texture_view)
+                    resource: wgpu::BindingResource::TextureView(&diffuse_view)
                 },
                 wgpu::BindGroupEntry{
                     binding: 11,
@@ -624,22 +668,25 @@ impl<'a> GPU<'a> {
             diffusion_pipeline,
             movement_pipeline,
             line_pipeline,
+            load_texture_pipeline,
 
             half_sum_pipeline,
             square_pipeline,
             diffusion_scale_pipeline,
 
+            load_texture_layout,
             line_group_layout,
             util_buffer_group_layout,
             half_sum_group_layout,
             
-            diffuse_storage,
+            diffuse_buffer,
             velocity_buffer,
             heat_buffer,
-            secondary_diffuse_storage,
+            secondary_diffuse_buffer,
             secondary_velocity_buffer,
             secondary_heat_buffer,
             diffuse,
+            diffuse_view,
             
             size_bind_group,
             gas_data_bind_group,
@@ -655,36 +702,68 @@ impl<'a> GPU<'a> {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, render_mode: u32) {
         let output = self.surface.get_current_texture().unwrap();
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
 
+        let copy_mode = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: Some("Copy Mode Buffer"),
+            contents: bytemuck::cast_slice(&[render_mode]),
+            usage: wgpu::BufferUsages::UNIFORM
+        });
 
-        encoder.copy_buffer_to_texture(
-            wgpu::ImageCopyBufferBase{
-                buffer: &self.diffuse_storage,
-                layout: wgpu::ImageDataLayout{ 
-                    offset: 0, 
-                    bytes_per_row: Some(self.pad_width * 4 * 4), 
-                    rows_per_image: None 
+        let load_texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor{
+            label: Some("Load To Texture Bind Group"),
+            layout: &self.load_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry{
+                    binding: 20,
+                    resource: wgpu::BindingResource::TextureView(&self.diffuse_view)
+                },
+                wgpu::BindGroupEntry{
+                    binding: 21,
+                    resource: copy_mode.as_entire_binding()
                 }
-            },
-            wgpu::ImageCopyTexture{
-                texture: &self.diffuse,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
-                aspect: wgpu::TextureAspect::All
-            },
-            wgpu::Extent3d{
-                width: self.backing_width,
-                height: self.backing_height,
-                depth_or_array_layers: 1
-            }
-        );
+            ]
+        });
+        //encoder.copy_buffer_to_texture(
+        //    wgpu::ImageCopyBufferBase{
+        //        buffer: &self.diffuse_buffer,
+        //        layout: wgpu::ImageDataLayout{ 
+        //            offset: 0, 
+        //            bytes_per_row: Some(self.pad_width * 4 * 4), 
+        //            rows_per_image: None 
+        //        }
+        //    },
+        //    wgpu::ImageCopyTexture{
+        //        texture: &self.diffuse,
+        //        mip_level: 0,
+        //        origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+        //        aspect: wgpu::TextureAspect::All
+        //    },
+        //    wgpu::Extent3d{
+        //        width: self.backing_width,
+        //        height: self.backing_height,
+        //        depth_or_array_layers: 1
+        //    }
+        //);
 
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor{
+                label: Some("Load Texture Pass"),
+                timestamp_writes: None
+            });
+
+            compute_pass.set_pipeline(&self.load_texture_pipeline);
+            compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
+            compute_pass.set_bind_group(2, &load_texture_bind_group, &[]);
+            compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+        }
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -775,9 +854,9 @@ impl<'a> GPU<'a> {
         }
 
         encoder.copy_buffer_to_buffer(
-            &self.secondary_diffuse_storage,
+            &self.secondary_diffuse_buffer,
             0,
-            &self.diffuse_storage,
+            &self.diffuse_buffer,
             0,
             self.pad_width as u64 * self.backing_height as u64 * 4 * 4
         );
@@ -821,9 +900,9 @@ impl<'a> GPU<'a> {
         }
 
         encoder.copy_buffer_to_buffer(
-            &self.secondary_diffuse_storage,
+            &self.secondary_diffuse_buffer,
             0,
-            &self.diffuse_storage,
+            &self.diffuse_buffer,
             0,
             self.pad_width as u64 * self.backing_height as u64 * 4 * 4
         );
@@ -938,7 +1017,7 @@ impl<'a> GPU<'a> {
             entries: &[
                 wgpu::BindGroupEntry{
                     binding: 0,
-                    resource: self.secondary_diffuse_storage.as_entire_binding()
+                    resource: self.secondary_diffuse_buffer.as_entire_binding()
                 }
             ]
         });
@@ -970,7 +1049,7 @@ impl<'a> GPU<'a> {
             let (active_bind_group, active_buffer, main_buffer ,size, block_size)= match i {
                 0 | 1 => (&velocity_bind_group, &self.secondary_velocity_buffer,&self.velocity_buffer,(self.backing_width, self.backing_height),2),
                 2 => (&heat_bind_group, &self.secondary_heat_buffer,&self.heat_buffer,(self.backing_width, self.backing_height),1),
-                3 => (&diffuse_bind_group, &self.secondary_diffuse_storage,&self.diffuse_storage,(self.backing_width, self.backing_height),4),
+                3 => (&diffuse_bind_group, &self.secondary_diffuse_buffer,&self.diffuse_buffer,(self.backing_width, self.backing_height),4),
                 _ => panic!("Error invalid i")
             };  
 
@@ -980,9 +1059,9 @@ impl<'a> GPU<'a> {
 
             if i == 0 {
                 encoder.copy_buffer_to_buffer(
-                    &self.diffuse_storage,
+                    &self.diffuse_buffer,
                     0,
-                    &self.secondary_diffuse_storage,
+                    &self.secondary_diffuse_buffer,
                     0,
                     self.pad_width as u64 * self.backing_height as u64 * 4 * 4
                 );
@@ -1070,7 +1149,7 @@ impl<'a> GPU<'a> {
             label: Some("Diagnostic Encoder"),
         });
 
-        encoder.copy_buffer_to_buffer(&self.diffuse_storage, 4 * 4 * (point.0 as u64 + self.pad_width as u64 * point.1 as u64), &staging_buffer, 0, 16);
+        encoder.copy_buffer_to_buffer(&self.diffuse_buffer, 4 * 4 * (point.0 as u64 + self.pad_width as u64 * point.1 as u64), &staging_buffer, 0, 16);
         encoder.copy_buffer_to_buffer(&self.velocity_buffer, 2 * 4 * (point.0 as u64 + self.backing_width as u64 * point.1 as u64), &staging_buffer, 16, 8);
         encoder.copy_buffer_to_buffer(&self.heat_buffer, 4 * (point.0 as u64 + self.backing_width as u64 * point.1 as u64), &staging_buffer, 24, 4);
 
@@ -1102,6 +1181,7 @@ enum GPUCommand {
     Diffusion,
     ToggleLoop,
     SetTickRate{num_ticks: u32},
+    SetRenderMode{new_render_mode: u32},
     Line{line_points: Vec<Point>, line_config: LineConfig},
     Diagnostic,
     PixelDiagnostic{point: Point},
@@ -1142,6 +1222,7 @@ impl winit::application::ApplicationHandler for App {
             std::thread::spawn(move || {
                 let mut compute_loop = false;
                 let mut num_ticks_per_frame = 60;
+                let mut render_mode = 0;
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_millis(20)) {
                         Err(e) => {
@@ -1150,20 +1231,21 @@ impl winit::application::ApplicationHandler for App {
                                 mpsc::RecvTimeoutError::Timeout => {
                                     if compute_loop {
                                         gpu.compute(num_ticks_per_frame);
-                                        gpu.render();
+                                        gpu.render(render_mode);
                                     }
                                 }
                             }
                         }
                         Ok(command) => {
                             match command {
-                                GPUCommand::Resize { width, height } => {gpu.resize(width, height); gpu.render()}
-                                GPUCommand::Compute { num_ticks} => {gpu.compute(num_ticks); gpu.render()}
-                                GPUCommand::Movement => {gpu.movement(); gpu.render()}
-                                GPUCommand::Diffusion => {gpu.diffusion(); gpu.render()}
+                                GPUCommand::Resize { width, height } => {gpu.resize(width, height); gpu.render(render_mode)}
+                                GPUCommand::Compute { num_ticks} => {gpu.compute(num_ticks); gpu.render(render_mode)}
+                                GPUCommand::Movement => {gpu.movement(); gpu.render(render_mode)}
+                                GPUCommand::Diffusion => {gpu.diffusion(); gpu.render(render_mode)}
                                 GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
                                 GPUCommand::SetTickRate { num_ticks } => {num_ticks_per_frame = num_ticks}
-                                GPUCommand::Line { line_points, line_config} => {gpu.line(&line_points,line_config); gpu.render()}
+                                GPUCommand::SetRenderMode { new_render_mode } => {render_mode = new_render_mode; gpu.render(render_mode)}
+                                GPUCommand::Line { line_points, line_config} => {gpu.line(&line_points,line_config); gpu.render(render_mode)}
                                 GPUCommand::Diagnostic => {gpu.print_diagnostics()}
                                 GPUCommand::PixelDiagnostic{point} => {gpu.pixel_diagnostics(point)}
                             }
@@ -1323,6 +1405,16 @@ impl winit::application::ApplicationHandler for App {
                                         (3,0) => {self.line_config.is_wall = false},
                                         (3,1) => {self.line_config.is_wall = true},
                                         (_,_) => println!("Unregonized mode target / mode")
+                                    }
+                                }
+                                "8" => {
+                                    println!("Enter Render Mode: ");
+                                    let mut input = String::new();
+                                    std::io::stdin().read_line(&mut input).unwrap();
+                                    input.pop();
+                                    let new_render_mode = input.parse::<u32>().unwrap();
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::SetRenderMode { new_render_mode }).unwrap();
                                     }
                                 }
                                 _ => {}

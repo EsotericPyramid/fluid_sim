@@ -16,7 +16,7 @@
 @group(2) @binding(10) var<storage,read> line_points: array<vec2<u32>>;
 @group(2) @binding(11) var<uniform> line_config: LineConfig;
 
-@group(2) @binding(20) var diffuse_texture_storage: texture_storage_2d<rgba8unorm,write>;
+@group(2) @binding(20) var diffuse_texture_storage: texture_storage_2d<rgba32float,write>;
 @group(2) @binding(21) var<uniform> copy_mode: u32;
 
 
@@ -487,19 +487,22 @@ fn load_to_texture(@builtin(global_invocation_id) global_id: vec3<u32>) {
         case 0u: {
             diffuse = diffuse_buffer[pad_index_2d(location)];
         }
-        case 1u: {
+        case 1u, 2u: {
             let vel = velocity_buffer[index_2d(location)];
             let angle = atan2(vel.y,vel.x);
-            let mag = sqrt(dot(vel,vel));
+            var mag = sqrt(dot(vel,vel));
+            mag *= select(1.0,total_diffuse(diffuse_buffer[pad_index_2d(location)]),copy_mode == 2u);
             diffuse = vec4(
-                max((3.0/(2.0*pi)) * abs(angle) - 0.5,0.0) * mag,
-                max(1.0 - (3.0/(2.0*pi)) * abs(angle + (pi/3.0)),0.0) * mag,
-                max(1.0 - (3.0/(2.0*pi)) * abs(angle - (pi/3.0)),0.0) * mag,
+                max((3.0/(2.0*pi)) * abs(angle) - 0.5,0.0),
+                max(1.0 - (3.0/(2.0*pi)) * abs(angle + (pi/3.0)),0.0),
+                max(1.0 - (3.0/(2.0*pi)) * abs(angle - (pi/3.0)),0.0),
                 1.0
             );
+            diffuse = diffuse * mag;
         }
-        case 2u: {
-            let heat = heat_buffer[index_2d(location)];
+        case 3u, 4u: {
+            var heat = heat_buffer[index_2d(location)];
+            heat *= select(1.0,total_diffuse(diffuse_buffer[pad_index_2d(location)]),copy_mode == 4u);
             diffuse = vec4(heat,heat,heat,1.0);
         }
         default: {}
