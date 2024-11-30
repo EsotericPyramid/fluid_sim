@@ -19,6 +19,8 @@
 @group(2) @binding(20) var diffuse_texture_storage: texture_storage_2d<rgba32float,write>;
 @group(2) @binding(21) var<uniform> copy_mode: u32;
 
+@group(2) @binding(30) var<storage,read> frame: array<f32>;
+
 
 @group(3) @binding(0) var<storage,read_write> mode_buffer: array<atomic<u32>>;
 
@@ -437,7 +439,6 @@ fn movement_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 }
 
-
 @compute
 @workgroup_size(64)
 fn line_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -505,7 +506,29 @@ fn load_to_texture(@builtin(global_invocation_id) global_id: vec3<u32>) {
             heat *= select(1.0,total_diffuse(diffuse_buffer[pad_index_2d(location)]),copy_mode == 4u);
             diffuse = vec4(heat,heat,heat,1.0);
         }
+        case 5u: {
+            let angle = clamp(total_diffuse(diffuse_buffer[pad_index_2d(location)]),0.0,3.0)/3.0;
+            diffuse = vec4(
+                max(2.0 * abs(angle - 0.75) - 0.5,0.0),
+                max(1 - 2.0 * abs(angle - 0.5),0.0),
+                max(1 - 2.0 * abs(angle - 1.0),0.0),
+                1.0
+            );
+        }
         default: {}
     }
+    diffuse = select(diffuse, vec4(1.0,1.0,1.0,1.0), (mode_buffer_get_2d(location) & 0x00000003u) == 0x00000003u);
     textureStore(diffuse_texture_storage,location,diffuse);
+}
+
+@compute
+@workgroup_size(8,8)
+fn frame_apply(@builtin(global_invocation_id) global_id: vec3<u32>) {
+
+    let location = vec2(global_id.x,global_id.y);
+    let brightness = frame[index_2d(location)];
+
+    velocity_buffer[index_2d(location)] *= 0.998;
+    heat_buffer[index_2d(location)] *= 1.0 + (0.5 - brightness) * 0.01;
+    heat_buffer[index_2d(location)] = clamp(heat_buffer[index_2d(location)],0.1,0.5);
 }

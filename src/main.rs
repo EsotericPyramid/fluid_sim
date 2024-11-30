@@ -2,6 +2,7 @@
 
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::vec;
 
 use wgpu::util::BufferInitDescriptor;
 use wgpu::util::DeviceExt;
@@ -87,6 +88,9 @@ struct GPU<'a> {
     surface: wgpu::Surface<'a>,
     surface_config: wgpu::SurfaceConfiguration,
 
+    decoder: AsyncVideoDecoder,
+    frame_buffer: vec::IntoIter<ffmpeg_next::util::frame::Video>,
+
     backing_width: u32,
     backing_height: u32,
     pad_width: u32,
@@ -101,11 +105,14 @@ struct GPU<'a> {
     half_sum_pipeline: wgpu::ComputePipeline,
     square_pipeline: wgpu::ComputePipeline,
     diffusion_scale_pipeline: wgpu::ComputePipeline,
+    // fun pipeline
+    frame_apply_pipeline: wgpu::ComputePipeline,
 
     line_group_layout: wgpu::BindGroupLayout,
     load_texture_layout: wgpu::BindGroupLayout,
     util_buffer_group_layout: wgpu::BindGroupLayout,
     half_sum_group_layout: wgpu::BindGroupLayout,
+    frame_group_layout: wgpu::BindGroupLayout,
 
     diffuse_buffer: wgpu::Buffer,
     velocity_buffer: wgpu::Buffer,
@@ -335,6 +342,22 @@ impl<'a> GPU<'a> {
                 }
             ]
         });
+
+        let frame_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Frame Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 30,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer{ 
+                        ty: wgpu::BufferBindingType::Storage { read_only: true }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: None
+                    },
+                    count: None
+                }
+            ]
+        });
     
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
@@ -430,7 +453,7 @@ impl<'a> GPU<'a> {
 
         let load_texture_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
             label: Some("Load To Texture Pipeline Layout"),
-            bind_group_layouts: &[&size_group_layout,&diffuse_buffer_group_layout,&load_texture_layout],
+            bind_group_layouts: &[&size_group_layout,&diffuse_buffer_group_layout,&load_texture_layout,&mode_layout],
             push_constant_ranges: &[]
         });
 
@@ -484,6 +507,21 @@ impl<'a> GPU<'a> {
             layout: Some(&diffusion_scale_pipeline_layout),
             module: &util_shader,
             entry_point: "diffusion_scale",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None
+        });
+
+        let frame_apply_scale_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{
+            label: Some("Frame Apply Scale Pipeline Layout"),
+            bind_group_layouts: &[&size_group_layout,&diffuse_buffer_group_layout,&frame_group_layout,&mode_layout],
+            push_constant_ranges: &[]
+        });
+
+        let frame_apply_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{
+            label: Some("Frame Apply Pipeline"),
+            layout: Some(&frame_apply_scale_pipeline_layout),
+            module: &sim_shader,
+            entry_point: "frame_apply",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None
         });
@@ -659,6 +697,9 @@ impl<'a> GPU<'a> {
             surface,
             surface_config,
 
+            decoder: AsyncVideoDecoder::new(backing_width,backing_height),
+            frame_buffer: Vec::new().into_iter(),
+
             backing_width,
             backing_height,
             pad_width,
@@ -674,10 +715,13 @@ impl<'a> GPU<'a> {
             square_pipeline,
             diffusion_scale_pipeline,
 
+            frame_apply_pipeline,
+
             load_texture_layout,
             line_group_layout,
             util_buffer_group_layout,
             half_sum_group_layout,
+            frame_group_layout,
             
             diffuse_buffer,
             velocity_buffer,
@@ -762,6 +806,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &load_texture_bind_group, &[]);
+            compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
             compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
         }
 
@@ -804,16 +849,51 @@ impl<'a> GPU<'a> {
         output.present();
     }
 
-    fn compute(&mut self,num_ticks: u32) {
+    fn compute(&mut self,num_ticks: u32,apply_frame: bool) {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Compute Encoder"),
         });
+
+        let mut frame_bind_group = None;
+        loop {
+            if apply_frame {
+                if let Some(frame) = self.frame_buffer.next() {
+                    {
+                        let gpu_frame = self.device.create_buffer_init(&BufferInitDescriptor{
+                            label: Some("GPU Frame"),
+                            contents: frame.data(0),
+                            usage: wgpu::BufferUsages::STORAGE
+                        });
+    
+                        frame_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor{
+                            label: Some("Frame Bind Group"),
+                            layout: &self.frame_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry{
+                                    binding: 30,
+                                    resource: gpu_frame.as_entire_binding()
+                                }
+                            ]
+                        }));
+                    }
+                    break;
+                } else {
+                    if let Some(buffer) = self.decoder.get_frame_buf() {
+                        self.frame_buffer = buffer.into_iter();
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Compute Pass"),
                 timestamp_writes: None 
-            });       
+            });
             
             for _ in 0..num_ticks {
                 compute_pass.set_pipeline(&self.movement_pipeline);
@@ -828,6 +908,14 @@ impl<'a> GPU<'a> {
                 compute_pass.set_bind_group(2, &self.gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
                 compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                if let Some(frame_bind_group) = &frame_bind_group {
+                    compute_pass.set_pipeline(&self.frame_apply_pipeline);
+                    compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
+                    compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
+                    compute_pass.set_bind_group(2, &frame_bind_group, &[]);
+                    compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
+                    compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                }
             }
         }
 
@@ -1172,6 +1260,53 @@ impl<'a> GPU<'a> {
             println!("Total Energy: {}", ((data[4] * data[4] + data[5] * data[5]) / 2.0 + data[6]) * total);
         }
     }
+
+    fn frame_apply(&mut self) {
+        loop {
+            if let Some(frame) = self.frame_buffer.next() {
+                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Frame Apply Encoder"),
+                }); 
+
+                {
+                    let gpu_frame = self.device.create_buffer_init(&BufferInitDescriptor{
+                        label: Some("GPU Frame"),
+                        contents: frame.data(0),
+                        usage: wgpu::BufferUsages::STORAGE
+                    });
+
+                    let frame_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor{
+                        label: Some("Frame Bind Group"),
+                        layout: &self.frame_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry{
+                                binding: 30,
+                                resource: gpu_frame.as_entire_binding()
+                            }
+                        ]
+                    });
+                    let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Compute Pass"),
+                        timestamp_writes: None 
+                    });   
+                    compute_pass.set_pipeline(&self.frame_apply_pipeline);
+                    compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
+                    compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
+                    compute_pass.set_bind_group(2, &frame_bind_group, &[]);
+                    compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
+                    compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                }
+                self.queue.submit(std::iter::once(encoder.finish()));
+                break;
+            } else {
+                if let Some(buffer) = self.decoder.get_frame_buf() {
+                    self.frame_buffer = buffer.into_iter();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 enum GPUCommand {
@@ -1185,6 +1320,7 @@ enum GPUCommand {
     Line{line_points: Vec<Point>, line_config: LineConfig},
     Diagnostic,
     PixelDiagnostic{point: Point},
+    FrameApply,
 }
 
 struct GPUSize {
@@ -1192,6 +1328,120 @@ struct GPUSize {
     surface_height: u32,
     backing_width: u32,
     backing_height: u32
+}
+
+struct VideoDecoder {
+    ictx: ffmpeg_next::format::context::Input,
+    decoder: ffmpeg_next::codec::decoder::Video,
+    scaler: ffmpeg_next::software::scaling::context::Context,
+    video_stream_index: usize,
+    frame_buf: Vec<ffmpeg_next::util::frame::Video>,
+    intermediate_buf_frame: ffmpeg_next::util::frame::Video
+}
+
+impl VideoDecoder {
+    fn new(output_width: u32, output_height: u32) -> Self {
+        ffmpeg_next::init().unwrap();
+
+        let ictx = ffmpeg_next::format::input("Bad_Apple.mp4").unwrap();
+        let input = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
+        let video_stream_index = input.index();
+
+        let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters()).unwrap();
+        let decoder = context_decoder.decoder().video().unwrap();
+
+        let scaler = ffmpeg_next::software::scaling::context::Context::get(
+            decoder.format(),
+            decoder.width(),
+            decoder.height(),
+            ffmpeg_next::format::Pixel::GRAYF32LE,
+            output_width,
+            output_height,
+            ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+        ).unwrap();
+
+        VideoDecoder {
+            ictx,
+            decoder,
+            scaler,
+            video_stream_index,
+            frame_buf: Vec::new(),
+            intermediate_buf_frame: ffmpeg_next::util::frame::Video::empty()
+        }
+    }
+
+    fn process_frame(&mut self) -> bool {
+        if self.frame_buf.len() < 90 {
+            let mut packets = self.ictx.packets().filter(|(stream,_)| stream.index() == self.video_stream_index);
+            while self.decoder.receive_frame(&mut self.intermediate_buf_frame).is_err() {
+                match packets.next() {
+                    Some((_,packet)) => {
+                        self.decoder.send_packet(&packet).unwrap();
+                    }
+                    None => {return false;}
+                }
+            }
+            let mut processed_frame = ffmpeg_next::util::frame::Video::empty();
+            self.scaler.run(&self.intermediate_buf_frame, &mut processed_frame).unwrap();
+            self.frame_buf.push(processed_frame);
+        }
+        true
+    }
+
+    fn dump_frame_buf(&mut self) -> Vec<ffmpeg_next::util::frame::Video> {
+        std::mem::replace(&mut self.frame_buf, Vec::new())
+    }
+}
+
+struct AsyncVideoDecoder {
+    decode_thread_sender: mpsc::Sender<()>,
+    decode_thread_reciever: mpsc::Receiver<Vec<ffmpeg_next::util::frame::Video>>
+}
+
+impl AsyncVideoDecoder {
+    fn new(output_width: u32, output_height: u32) -> Self {
+        let (signal_tx,signal_rx) = mpsc::channel();
+        let (data_tx, data_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut decoder = VideoDecoder::new(output_width,output_height);
+            loop {
+                match signal_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Err(e) => {
+                        match e {
+                            mpsc::RecvTimeoutError::Disconnected => {break;}
+                            mpsc::RecvTimeoutError::Timeout => {
+                                if !decoder.process_frame() {
+                                    data_tx.send(decoder.dump_frame_buf()).unwrap();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        data_tx.send(decoder.dump_frame_buf()).unwrap();
+                    }
+                }
+            }
+        });
+
+        AsyncVideoDecoder {
+            decode_thread_sender: signal_tx,
+            decode_thread_reciever: data_rx
+        }
+    }
+
+    fn get_frame_buf(&self) -> Option<Vec<ffmpeg_next::util::frame::Video>> {
+        let _ = self.decode_thread_sender.send(());
+        match self.decode_thread_reciever.recv() {
+            Err(_) => {
+                None
+            }
+            Ok(out) => {
+                Some(out)
+            }
+        }
+    }
 }
 
 struct App {
@@ -1205,7 +1455,7 @@ struct App {
     line_config: LineConfig,
 
     gpu: Option<mpsc::Sender<GPUCommand>>,
-    gpu_size: Option<GPUSize>
+    gpu_size: Option<GPUSize>,
 }
 
 impl winit::application::ApplicationHandler for App {
@@ -1220,18 +1470,22 @@ impl winit::application::ApplicationHandler for App {
             self.window = Some(window);
             let (tx,rx) = mpsc::channel();
             std::thread::spawn(move || {
-                let mut compute_loop = false;
                 let mut num_ticks_per_frame = 60;
                 let mut render_mode = 0;
+                let timer = std::time::Instant::now();
+                let framerate = 30.0;
+                let apply_frames = true;
+                let mut next_frame_time: Option<std::time::Duration> = None;
                 loop {
-                    match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                    match rx.recv_timeout(next_frame_time.map_or(std::time::Duration::from_millis(20), |next_frame_time| next_frame_time - std::cmp::min(timer.elapsed(), next_frame_time))) {
                         Err(e) => {
                             match e {
                                 mpsc::RecvTimeoutError::Disconnected => {break;}
                                 mpsc::RecvTimeoutError::Timeout => {
-                                    if compute_loop {
-                                        gpu.compute(num_ticks_per_frame);
+                                    if let Some(next_frame_time) = &mut next_frame_time {
+                                        gpu.compute(num_ticks_per_frame,apply_frames);
                                         gpu.render(render_mode);
+                                        *next_frame_time += std::time::Duration::from_secs_f64(1.0/framerate);
                                     }
                                 }
                             }
@@ -1239,15 +1493,19 @@ impl winit::application::ApplicationHandler for App {
                         Ok(command) => {
                             match command {
                                 GPUCommand::Resize { width, height } => {gpu.resize(width, height); gpu.render(render_mode)}
-                                GPUCommand::Compute { num_ticks} => {gpu.compute(num_ticks); gpu.render(render_mode)}
+                                GPUCommand::Compute { num_ticks} => {gpu.compute(num_ticks,apply_frames); gpu.render(render_mode)}
                                 GPUCommand::Movement => {gpu.movement(); gpu.render(render_mode)}
                                 GPUCommand::Diffusion => {gpu.diffusion(); gpu.render(render_mode)}
-                                GPUCommand::ToggleLoop => {compute_loop = !compute_loop}
+                                GPUCommand::ToggleLoop => {next_frame_time = match next_frame_time {
+                                    None => Some(timer.elapsed()),
+                                    Some(_) => None,
+                                }}
                                 GPUCommand::SetTickRate { num_ticks } => {num_ticks_per_frame = num_ticks}
                                 GPUCommand::SetRenderMode { new_render_mode } => {render_mode = new_render_mode; gpu.render(render_mode)}
                                 GPUCommand::Line { line_points, line_config} => {gpu.line(&line_points,line_config); gpu.render(render_mode)}
                                 GPUCommand::Diagnostic => {gpu.print_diagnostics()}
                                 GPUCommand::PixelDiagnostic{point} => {gpu.pixel_diagnostics(point)}
+                                GPUCommand::FrameApply => {gpu.frame_apply(); gpu.render(render_mode);}
                             }
                         }
                     }
@@ -1294,6 +1552,13 @@ impl winit::application::ApplicationHandler for App {
                 );
                 self.window = None;
                 self.gpu = None;
+                println!(
+                    "--------------------------------------------------------- Window {} Destroyed",
+                    self.idx
+                );
+                self.window_id = None;
+                event_loop.exit();
+                return;
             },
             WindowEvent::RedrawRequested => {
                 
@@ -1339,6 +1604,22 @@ impl winit::application::ApplicationHandler for App {
                                     input.pop();
                                     if let Some(gpu) = &mut self.gpu {
                                         gpu.send(GPUCommand::SetTickRate { num_ticks: input.parse::<u32>().unwrap()}).unwrap();
+                                    }
+                                }
+                                "w" => {
+                                    if let Some(gpu) = &self.gpu {
+                                        if let Some(size) = &self.gpu_size {
+                                            gpu.send(GPUCommand::Line{
+                                                line_points: std::mem::replace(&mut vec![
+                                                    Point(0,0),
+                                                    Point(0,size.backing_height),
+                                                    Point(size.backing_width,size.backing_height),
+                                                    Point(size.backing_width,0),
+                                                    Point(0,0)
+                                                ], Vec::new()), 
+                                                line_config: self.line_config.clone()
+                                            }).unwrap();
+                                        }
                                     }
                                 }
                                 "1" => {
@@ -1417,6 +1698,11 @@ impl winit::application::ApplicationHandler for App {
                                         gpu.send(GPUCommand::SetRenderMode { new_render_mode }).unwrap();
                                     }
                                 }
+                                "g" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::FrameApply).unwrap();
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -1468,9 +1754,8 @@ impl winit::application::ApplicationHandler for App {
 }
 
 fn main() {
-
     env_logger::init();
-
+    
 
     let event_loop = EventLoop::new().unwrap();
     let mut app = App{
@@ -1492,7 +1777,7 @@ fn main() {
         },
 
         gpu: None, 
-        gpu_size: None
+        gpu_size: None,
     };
     event_loop.run_app(&mut app).unwrap();
     println!("test");
