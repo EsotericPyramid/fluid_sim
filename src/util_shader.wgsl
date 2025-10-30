@@ -14,12 +14,7 @@ struct HalfSumSize {
 
 struct Size {
     backing_width: u32,
-    backing_height: u32,
-    pad_width: u32
-}
-
-fn pad_index_2d(point: vec2<u32>) -> u32 {
-    return point.x + size.pad_width * point.y;
+    backing_height: u32
 }
 
 fn index_2d(point: vec2<u32>) -> u32 {
@@ -81,10 +76,10 @@ fn diffusion_scale(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let location = vec2(global_id.x,global_id.y);
     
     let diffuse = vec4(
-        diffuse_buffer[4 * pad_index_2d(location) + 0],
-        diffuse_buffer[4 * pad_index_2d(location) + 1],
-        diffuse_buffer[4 * pad_index_2d(location) + 2],
-        diffuse_buffer[4 * pad_index_2d(location) + 3]
+        diffuse_buffer[4 * index_2d(location) + 0],
+        diffuse_buffer[4 * index_2d(location) + 1],
+        diffuse_buffer[4 * index_2d(location) + 2],
+        diffuse_buffer[4 * index_2d(location) + 3]
     );
     let diffuse_total = total_diffuse(diffuse);
     for (var i = 0u; i < block_sizing; i++) {

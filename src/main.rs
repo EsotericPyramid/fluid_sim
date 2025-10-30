@@ -13,26 +13,7 @@ use winit::window::*;
 use winit::event::*;
 use winit::event_loop::{ActiveEventLoop,EventLoop};
 
-fn pad_u32(x: u32, pad: u32) -> u32 {
-    if x > 0 {
-        return (((x -1) / pad) + 1) * pad;
-    } else {
-        return 0;
-    }
-}
-
-fn pad_u64(x: u64, pad: u64) -> u64 {
-    if x > 0 {
-        return (((x -1) / pad) + 1) * pad;
-    } else {
-        return 0;
-    }
-}
-
-fn round_up_div_u32(dividend: u32, divisor: u32) -> u32 {
-    ((dividend -1) / divisor) + 1
-}
-
+//no clue why this gives warnings
 #[repr(C)]
 #[derive(Clone,Copy,bytemuck::Zeroable,bytemuck::Pod)]
 struct Point(u32,u32);
@@ -79,10 +60,7 @@ impl LineConfig {
     }
 }
 
-#[allow(dead_code)]
 struct GPU<'a> {
-    instance: wgpu::Instance,
-    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'a>,
@@ -93,8 +71,6 @@ struct GPU<'a> {
 
     backing_width: u32,
     backing_height: u32,
-    pad_width: u32,
-    pad_height: u32,
 
     render_pipeline: wgpu::RenderPipeline,
     diffusion_pipeline: wgpu::ComputePipeline,
@@ -120,7 +96,6 @@ struct GPU<'a> {
     secondary_diffuse_buffer: wgpu::Buffer,
     secondary_velocity_buffer: wgpu::Buffer,
     secondary_heat_buffer: wgpu::Buffer,
-    diffuse: wgpu::Texture,
     diffuse_view: wgpu::TextureView,
 
     size_bind_group: wgpu::BindGroup,
@@ -132,15 +107,12 @@ struct GPU<'a> {
 
 impl<'a> GPU<'a> {
     async fn new(window: Arc<Window>,backing_width: u32, backing_height: u32) -> Self {
-        let pad_width = pad_u32(backing_width,16);
-        let pad_height = pad_u32(backing_height,8);
-
         let instance = wgpu::Instance::default();
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptionsBase::default()).await.unwrap();
         let (device,queue) = adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::Performance
         }, None).await.unwrap();
 
@@ -528,13 +500,13 @@ impl<'a> GPU<'a> {
 
         let size_buffer = device.create_buffer_init(&BufferInitDescriptor{
             label: Some("Size Buffer"),
-            contents: bytemuck::cast_slice(&[backing_width,backing_height,pad_width]),
+            contents: bytemuck::cast_slice(&[backing_width,backing_height]),
             usage: wgpu::BufferUsages::UNIFORM
         });
 
         let diffuse_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Diffuse Buffer"),
-            size: pad_width  as u64 * backing_height as u64 * 4 * 4,
+            size: backing_width  as u64 * backing_height as u64 * 4 * 4,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
@@ -555,28 +527,28 @@ impl<'a> GPU<'a> {
 
         let secondary_diffuse_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Secondary Diffuse Buffer"),
-            size: pad_width  as u64 * backing_height as u64 * 4 * 4,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            size: backing_width  as u64 * backing_height as u64 * 4 * 4,
+            usage: wgpu::BufferUsages::COPY_SRC  | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
 
         let secondary_velocity_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Secondary Velocity Buffer"),
             size: backing_width as u64 * backing_height as u64 * 4 * 2,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::COPY_SRC  | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
 
         let secondary_heat_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Secondary Heat Buffer"),
             size: backing_width as u64 * backing_height as u64 * 4,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::COPY_SRC  | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
 
         let mode_buffer = device.create_buffer(&wgpu::BufferDescriptor{
             label: Some("Wall Buffer"),
-            size: pad_u64((backing_width as u64 * backing_height as u64) / 2,4), //stored as a bit array which is truly [u32]
+            size: ((backing_width as u64 * backing_height as u64) / 2).next_multiple_of(4), //stored as a bit array which is truly [u32]
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false
         });
@@ -588,7 +560,7 @@ impl<'a> GPU<'a> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[wgpu::TextureFormat::Rgba32Float]
         });
 
@@ -690,8 +662,6 @@ impl<'a> GPU<'a> {
         });
 
         GPU{
-            instance,
-            adapter,
             device,
             queue,
             surface,
@@ -702,8 +672,6 @@ impl<'a> GPU<'a> {
 
             backing_width,
             backing_height,
-            pad_width,
-            pad_height,
 
             render_pipeline,
             diffusion_pipeline,
@@ -729,7 +697,6 @@ impl<'a> GPU<'a> {
             secondary_diffuse_buffer,
             secondary_velocity_buffer,
             secondary_heat_buffer,
-            diffuse,
             diffuse_view,
             
             size_bind_group,
@@ -778,7 +745,7 @@ impl<'a> GPU<'a> {
         //        buffer: &self.diffuse_buffer,
         //        layout: wgpu::ImageDataLayout{ 
         //            offset: 0, 
-        //            bytes_per_row: Some(self.pad_width * 4 * 4), 
+        //            bytes_per_row: Some(self.backing_width * 4 * 4), 
         //            rows_per_image: None 
         //        }
         //    },
@@ -807,7 +774,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &load_texture_bind_group, &[]);
             compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-            compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+            compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
         }
 
         {
@@ -836,15 +803,12 @@ impl<'a> GPU<'a> {
                 occlusion_query_set: None
             });
         
-            // NEW!
-            render_pass.set_pipeline(&self.render_pipeline); // 2.
+            render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.size_bind_group, &[]);
-            //render_pass.set_bind_group(1, &gas_data_bind_group, &[]);
             render_pass.set_bind_group(1, &self.fragment_bind_group, &[]);
-            render_pass.draw(0..6, 0..1); // 3.
+            render_pass.draw(0..6, 0..1);
         }
 
-        // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
     }
@@ -901,20 +865,20 @@ impl<'a> GPU<'a> {
                 compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-                compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
                 compute_pass.set_pipeline(&self.diffusion_pipeline);
                 compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
                 compute_pass.set_bind_group(1, &self.secondary_gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(2, &self.gas_data_bind_group, &[]);
                 compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-                compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
                 if let Some(frame_bind_group) = &frame_bind_group {
                     compute_pass.set_pipeline(&self.frame_apply_pipeline);
                     compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
-                    compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
+                    compute_pass.set_bind_group(1, &self.secondary_gas_data_bind_group, &[]);
                     compute_pass.set_bind_group(2, &frame_bind_group, &[]);
                     compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-                    compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                    compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
                 }
             }
         }
@@ -938,7 +902,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
             compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-            compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+            compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
         }
 
         encoder.copy_buffer_to_buffer(
@@ -946,7 +910,7 @@ impl<'a> GPU<'a> {
             0,
             &self.diffuse_buffer,
             0,
-            self.pad_width as u64 * self.backing_height as u64 * 4 * 4
+            self.backing_width as u64 * self.backing_height as u64 * 4 * 4
         );
 
         encoder.copy_buffer_to_buffer(
@@ -984,7 +948,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &self.secondary_gas_data_bind_group, &[]);
             compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-            compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+            compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
         }
 
         encoder.copy_buffer_to_buffer(
@@ -992,7 +956,7 @@ impl<'a> GPU<'a> {
             0,
             &self.diffuse_buffer,
             0,
-            self.pad_width as u64 * self.backing_height as u64 * 4 * 4
+            self.backing_width as u64 * self.backing_height as u64 * 4 * 4
         );
 
         encoder.copy_buffer_to_buffer(
@@ -1057,7 +1021,7 @@ impl<'a> GPU<'a> {
             compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
             compute_pass.set_bind_group(2, &line_bind_group, &[]);
             compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-            compute_pass.dispatch_workgroups(pad_u32(line_points.len() as u32 -1,64), 1, 1);
+            compute_pass.dispatch_workgroups((line_points.len() as u32 -1).div_ceil(64), 1, 1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -1087,7 +1051,7 @@ impl<'a> GPU<'a> {
             pass.set_pipeline(&self.half_sum_pipeline);
             pass.set_bind_group(0, buffer, &[]);
             pass.set_bind_group(1, &half_sum_bind_group, &[]);
-            pass.dispatch_workgroups(round_up_div_u32(self.backing_width * self.backing_height, chunk_size *  64), 1, 1);
+            pass.dispatch_workgroups(self.backing_width * self.backing_height.div_ceil(chunk_size *  64), 1, 1);
         }
     }
 
@@ -1151,7 +1115,7 @@ impl<'a> GPU<'a> {
                     0,
                     &self.secondary_diffuse_buffer,
                     0,
-                    self.pad_width as u64 * self.backing_height as u64 * 4 * 4
+                    self.backing_width as u64 * self.backing_height as u64 * 4 * 4
                 );
             }
 
@@ -1175,14 +1139,14 @@ impl<'a> GPU<'a> {
             if i == 1 { // KE run
                 diagnostic_pass.set_pipeline(&self.square_pipeline);
                 diagnostic_pass.set_bind_group(0, &velocity_bind_group, &[]);
-                diagnostic_pass.dispatch_workgroups(round_up_div_u32(self.backing_width * self.backing_height * 2,64), 1, 1);
+                diagnostic_pass.dispatch_workgroups((self.backing_width * self.backing_height * 2).div_ceil(64), 1, 1);
             }
             if i != 3 {
                 diagnostic_pass.set_pipeline(&self.diffusion_scale_pipeline);
                 diagnostic_pass.set_bind_group(0, active_bind_group, &[]);
                 diagnostic_pass.set_bind_group(1, &diffuse_bind_group, &[]);
                 diagnostic_pass.set_bind_group(2, &self.size_bind_group, &[]);
-                diagnostic_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                diagnostic_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
             }
             self.sum_buffer(diagnostic_pass, active_bind_group, block_size as u32);
     
@@ -1213,7 +1177,7 @@ impl<'a> GPU<'a> {
                     }
                     2 => {
                         println!("Heat:        {}",vec[0]);
-                        total_energy += vec[0]
+                        total_energy += vec[0];
                     }
                     3 => println!("Diffuse   R: {}, G: {}, B: {}, A: {}, Total (excl A): {}",vec[0],vec[1],vec[2],vec[3], vec[0] + vec[1] + vec[2]),
                     _ => panic!("Error: invalid i")
@@ -1237,7 +1201,7 @@ impl<'a> GPU<'a> {
             label: Some("Diagnostic Encoder"),
         });
 
-        encoder.copy_buffer_to_buffer(&self.diffuse_buffer, 4 * 4 * (point.0 as u64 + self.pad_width as u64 * point.1 as u64), &staging_buffer, 0, 16);
+        encoder.copy_buffer_to_buffer(&self.diffuse_buffer, 4 * 4 * (point.0 as u64 + self.backing_width as u64 * point.1 as u64), &staging_buffer, 0, 16);
         encoder.copy_buffer_to_buffer(&self.velocity_buffer, 2 * 4 * (point.0 as u64 + self.backing_width as u64 * point.1 as u64), &staging_buffer, 16, 8);
         encoder.copy_buffer_to_buffer(&self.heat_buffer, 4 * (point.0 as u64 + self.backing_width as u64 * point.1 as u64), &staging_buffer, 24, 4);
 
@@ -1294,7 +1258,7 @@ impl<'a> GPU<'a> {
                     compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
                     compute_pass.set_bind_group(2, &frame_bind_group, &[]);
                     compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
-                    compute_pass.dispatch_workgroups(pad_u32(self.backing_width,8)/8, self.pad_height/8, 1);
+                    compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
                 }
                 self.queue.submit(std::iter::once(encoder.finish()));
                 break;
@@ -1306,6 +1270,12 @@ impl<'a> GPU<'a> {
                 }
             }
         }
+    }
+
+    fn set_file_decode(&mut self, path: String) {
+        self.decoder.set_file_decode(path); 
+        self.frame_buffer = Vec::new().into_iter();
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -1321,6 +1291,8 @@ enum GPUCommand {
     Diagnostic,
     PixelDiagnostic{point: Point},
     FrameApply,
+    ToggleFrameApply,
+    SetFileDecode{path: String}
 }
 
 struct GPUSize {
@@ -1340,10 +1312,10 @@ struct VideoDecoder {
 }
 
 impl VideoDecoder {
-    fn new(output_width: u32, output_height: u32) -> Self {
+    fn new(output_width: u32, output_height: u32, path: String) -> Self {
         ffmpeg_next::init().unwrap();
 
-        let ictx = ffmpeg_next::format::input("Bad_Apple.mp4").unwrap();
+        let ictx = ffmpeg_next::format::input(&path).unwrap();
         let input = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
         let video_stream_index = input.index();
 
@@ -1394,8 +1366,8 @@ impl VideoDecoder {
 }
 
 struct AsyncVideoDecoder {
-    decode_thread_sender: mpsc::Sender<()>,
-    decode_thread_reciever: mpsc::Receiver<Vec<ffmpeg_next::util::frame::Video>>
+    decode_thread_sender: mpsc::Sender<VideoDecoderCommand>,
+    decode_thread_reciever: mpsc::Receiver<Option<Vec<ffmpeg_next::util::frame::Video>>>
 }
 
 impl AsyncVideoDecoder {
@@ -1404,22 +1376,35 @@ impl AsyncVideoDecoder {
         let (data_tx, data_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
-            let mut decoder = VideoDecoder::new(output_width,output_height);
+            let mut decoder: Option<VideoDecoder> = None;
             loop {
-                match signal_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                match signal_rx.recv_timeout(std::time::Duration::from_millis(match decoder {Some(_) => 10, None => 100})) {
                     Err(e) => {
                         match e {
                             mpsc::RecvTimeoutError::Disconnected => {break;}
                             mpsc::RecvTimeoutError::Timeout => {
-                                if !decoder.process_frame() {
-                                    data_tx.send(decoder.dump_frame_buf()).unwrap();
-                                    break;
+                                if let Some(decoder_inner) = &mut decoder {
+                                    if !decoder_inner.process_frame() {
+                                        data_tx.send(Some(decoder_inner.dump_frame_buf())).unwrap();
+                                        decoder = None;
+                                    }
                                 }
                             }
                         }
                     }
-                    Ok(_) => {
-                        data_tx.send(decoder.dump_frame_buf()).unwrap();
+                    Ok(command) => {
+                        match command {
+                            VideoDecoderCommand::DumpFrameBuf => {
+                                if let Some(decoder) = &mut decoder {
+                                    data_tx.send(Some(decoder.dump_frame_buf())).unwrap();
+                                } else {
+                                    data_tx.send(None).unwrap();
+                                }
+                            }
+                            VideoDecoderCommand::StartFileDecode { path } => {
+                                decoder = Some(VideoDecoder::new(output_width, output_height, path))
+                            }
+                        }
                     }
                 }
             }
@@ -1432,16 +1417,25 @@ impl AsyncVideoDecoder {
     }
 
     fn get_frame_buf(&self) -> Option<Vec<ffmpeg_next::util::frame::Video>> {
-        let _ = self.decode_thread_sender.send(());
+        let _ = self.decode_thread_sender.send(VideoDecoderCommand::DumpFrameBuf);
         match self.decode_thread_reciever.recv() {
             Err(_) => {
                 None
             }
             Ok(out) => {
-                Some(out)
+                out
             }
         }
     }
+
+    fn set_file_decode(&self, path: String) {
+        let _ = self.decode_thread_sender.send(VideoDecoderCommand::StartFileDecode { path });
+    }
+}
+
+enum VideoDecoderCommand {
+    DumpFrameBuf,
+    StartFileDecode{path: String}
 }
 
 struct App {
@@ -1466,7 +1460,13 @@ impl winit::application::ApplicationHandler for App {
             let window = Arc::new(event_loop.create_window(Window::default_attributes()).unwrap());
             window.set_max_inner_size(Some(PhysicalSize{width: 2048, height: 2048}));
             let size = window.inner_size();
-            let mut gpu = pollster::block_on(GPU::new(window.clone(),size.width,size.height));
+            println!("Enter Backing Scale: ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+            input.pop();
+            let backing_scale = input.parse::<f32>().unwrap();
+            println!("Backing width: {}, Backing Height: {}", (size.width as f32 * backing_scale) as u32, (size.height as f32 * backing_scale) as u32);
+            let mut gpu = pollster::block_on(GPU::new(window.clone(),(size.width as f32 * backing_scale) as u32, (size.height as f32 * backing_scale) as u32));
             self.window = Some(window);
             let (tx,rx) = mpsc::channel();
             std::thread::spawn(move || {
@@ -1474,7 +1474,7 @@ impl winit::application::ApplicationHandler for App {
                 let mut render_mode = 0;
                 let timer = std::time::Instant::now();
                 let framerate = 30.0;
-                let apply_frames = true;
+                let mut apply_frames = false;
                 let mut next_frame_time: Option<std::time::Duration> = None;
                 loop {
                     match rx.recv_timeout(next_frame_time.map_or(std::time::Duration::from_millis(20), |next_frame_time| next_frame_time - std::cmp::min(timer.elapsed(), next_frame_time))) {
@@ -1506,6 +1506,8 @@ impl winit::application::ApplicationHandler for App {
                                 GPUCommand::Diagnostic => {gpu.print_diagnostics()}
                                 GPUCommand::PixelDiagnostic{point} => {gpu.pixel_diagnostics(point)}
                                 GPUCommand::FrameApply => {gpu.frame_apply(); gpu.render(render_mode);}
+                                GPUCommand::ToggleFrameApply => {apply_frames = !apply_frames;}
+                                GPUCommand::SetFileDecode{path} => {gpu.set_file_decode(path);}
                             }
                         }
                     }
@@ -1515,8 +1517,8 @@ impl winit::application::ApplicationHandler for App {
             self.gpu_size = Some(GPUSize{
                 surface_width: size.width, 
                 surface_height: size.height,
-                backing_width: size.width,
-                backing_height: size.height
+                backing_width: (size.width as f32 * backing_scale) as u32,
+                backing_height: (size.height as f32 * backing_scale) as u32
             });
         }
     }
@@ -1662,7 +1664,8 @@ impl winit::application::ApplicationHandler for App {
                                     let mut input = String::new();
                                     std::io::stdin().read_line(&mut input).unwrap();
                                     input.pop();
-                                    self.line_config.heat = input.parse::<f32>().unwrap();
+                                    let heat = input.parse::<f32>().unwrap();
+                                    self.line_config.heat = heat * heat;
                                 }
                                 "7" => {
                                     println!("Enter Mode Target (0: color, 1: velocity, 2: heat, 3: wall): ");
@@ -1701,6 +1704,20 @@ impl winit::application::ApplicationHandler for App {
                                 "g" => {
                                     if let Some(gpu) = &mut self.gpu {
                                         gpu.send(GPUCommand::FrameApply).unwrap();
+                                    }
+                                }
+                                "t" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        gpu.send(GPUCommand::ToggleFrameApply).unwrap();
+                                    }
+                                }
+                                "b" => {
+                                    if let Some(gpu) = &mut self.gpu {
+                                        println!("Enter Path");
+                                        let mut input = String::new();
+                                        std::io::stdin().read_line(&mut input).unwrap();
+                                        input.pop();
+                                        let _ = gpu.send(GPUCommand::SetFileDecode { path: input });
                                     }
                                 }
                                 _ => {}
@@ -1781,5 +1798,5 @@ fn main() {
     };
     event_loop.run_app(&mut app).unwrap();
     println!("test");
+    println!("test");
 }
-
