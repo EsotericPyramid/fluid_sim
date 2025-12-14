@@ -875,7 +875,7 @@ impl<'a> GPU<'a> {
                 if let Some(frame_bind_group) = &frame_bind_group {
                     compute_pass.set_pipeline(&self.frame_apply_pipeline);
                     compute_pass.set_bind_group(0, &self.size_bind_group, &[]);
-                    compute_pass.set_bind_group(1, &self.secondary_gas_data_bind_group, &[]);
+                    compute_pass.set_bind_group(1, &self.gas_data_bind_group, &[]);
                     compute_pass.set_bind_group(2, &frame_bind_group, &[]);
                     compute_pass.set_bind_group(3, &self.mode_bind_group, &[]);
                     compute_pass.dispatch_workgroups(self.backing_width.div_ceil(8), self.backing_height.div_ceil(8), 1);
@@ -1386,6 +1386,7 @@ impl AsyncVideoDecoder {
                                 if let Some(decoder_inner) = &mut decoder {
                                     if !decoder_inner.process_frame() {
                                         data_tx.send(Some(decoder_inner.dump_frame_buf())).unwrap();
+                                        println!("Finished Playing File");
                                         decoder = None;
                                     }
                                 }
