@@ -14,8 +14,8 @@ will interact with adjacent cells (including diagonally) accordingly.
 - 7: set the mode of the cells to gas is newly added:
   -  0: Color
       -  0: Color behaves normally, each individual color conserved
-      -  1: The hue of the cell remains constant, conserves overall gas amount
-      -  2: The colored gas in the cell remains constant, same color and amount
+      -  1: The colored gas in the cell remains constant, same color and amount
+      -  2: The hue of the cell remains constant, conserves overall gas amount
   -  1: Velocity
       -  0: Velocity behaves normally
       -  1: Velocity of the cell remains constant
